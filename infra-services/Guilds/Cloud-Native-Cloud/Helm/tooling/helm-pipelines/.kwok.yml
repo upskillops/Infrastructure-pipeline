@@ -1,0 +1,29 @@
+---
+# Define environment variables
+variables:
+  IMAGE_KWOK_CLUSTER: "omvedi25/kwok-helm:v0.0"
+
+# Define CI/CD stages
+stages:
+  - integration
+
+# Create KWOK Cluster
+create_kwok_cluster:
+  image:
+    name: "$IMAGE_KWOK_CLUSTER"
+  stage: integration
+  script:
+    - echo "🚀 Starting KWOK cluster creation..."
+    - kwokctl create cluster  || { echo "❌ Cluster creation failed"; exit 1; }
+    - echo "✅ KWOK cluster created successfully!"
+    - kwokctl stop cluster
+    - kwokctl start cluster
+    - kubectl config use-context kwok-kwok
+    - kubectl --kubeconfig /root/.kwok/clusters/kwok/kubeconfig.yaml get nodes
+    - kwokctl --kubeconfig /root/.kwok/clusters/kwok/kubeconfig.yaml scale node --replicas 1
+    - kubectl --kubeconfig /root/.kwok/clusters/kwok/kubeconfig.yaml get nodes
+    - kubectl --kubeconfig /root/.kwok/clusters/kwok/kubeconfig.yaml wait --for=condition=Ready node --all --timeout=180s || { echo "❌ Node did not become Ready in time"; exit 1; }
+    - kubectl --kubeconfig /root/.kwok/clusters/kwok/kubeconfig.yaml get nodes
+  
+  after_script:
+    - echo "✅ KWOK environment setup complete."

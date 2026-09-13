@@ -1,0 +1,12 @@
+include:
+  - project: 'infrastructure149/aws/accounts/administration/administration_cicd_pipeline'
+    file: '.gitlab-ci.yml'
+    ref: main
+
+variables:
+  blueprint_url:
+    value: "https://${gitlab_user}:${gitlab_password}@gitlab.com/infrastructure149/aws/aws_tfblueprints/instance_tf"
+    description: "Blueprint URL"
+  blueprint_version:
+    value: "v0.0"
+    description: "Blueprint tag version"

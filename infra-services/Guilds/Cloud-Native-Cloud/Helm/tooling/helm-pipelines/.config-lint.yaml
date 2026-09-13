@@ -1,0 +1,15 @@
+---
+variables:
+  CONFIG_LINT: "omvedi25/config-lint:v1.1"
+
+stages:
+  - validation
+
+validation:k8syaml:
+  image: "$CONFIG_LINT"
+  stage: validation
+  tags:
+   - kubernetes
+  script:
+  - helm template . > template.yaml
+  - config-lint -rules rules/rules.yaml template.yaml  | grep -i "RuleMessage" | uniq

@@ -1,0 +1,51 @@
+---
+variables:
+  IMAGE_CONFTEST: "omvedi25/conftest:v0.2"
+  IMAGE_SNYK: "omvedi25/snyk:v0.1"
+  IMAGE_LINTER: "omvedi25/dockerlinter:v0.0"
+
+stages:
+  - lint
+  - validation
+  - scan
+  - push
+
+linting:Dockerfile:
+  image: "$IMAGE_LINTER"
+  stage: lint
+  script:
+    - |
+       dockerlinter -f Dockerfile -e 
+
+validation:Dockerfile:
+  image: "$IMAGE_CONFTEST"
+  stage: validation
+  script:
+    - conftest test -p /policy Dockerfile
+
+scanning:Image:
+  image: "$IMAGE_SNYK"
+  stage: scan
+  script:
+    - podman build -t test-image .
+    - image_id=`podman images --format "table {{.Repository}}\t{{.ID}}" | awk '$1 == "localhost/test-image" {print $2}'`
+    - podman save $image_id -o test-image.tar
+    - snyk auth $SNYK_TOKEN
+    - snyk container test docker-archive:test-image.tar --json > results.json || true
+    - snyk-to-html -i results.json -o results.html
+    - snyk container test docker-archive:test-image.tar  --severity-threshold=high || exit 1
+  artifacts:
+    paths:
+      - results.html
+    expire_in: 1 week
+
+pushing:Image:
+  image: "$IMAGE_SNYK"
+  stage: push
+  script:
+    - podman login -u $USERNAME -p $PASSWORD docker.io 
+    - podman build -t test .
+    - podman tag localhost/test:latest omvedi25/$CI_PROJECT_NAME:$CI_COMMIT_SHA
+    - podman images
+    - podman push omvedi25/$CI_PROJECT_NAME:$CI_COMMIT_SHA
+  when: manual  

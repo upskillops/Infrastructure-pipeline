@@ -1,0 +1,284 @@
+######################### Default image #########################
+default:
+  image: omvedi25/terraform-image:v0.0.0
+  interruptible: true
+
+######################### Global Variables #######################
+variables:
+  TF_VAR_blueprint_url: "git::${blueprint_url}.git?ref=${blueprint_version}"
+  TF_VAR_deployment_url: "${CI_PROJECT_URL}"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  central_branch: "master"
+  central_pj_url: ""
+  is_central_pl: "true"
+
+######################### Stages ##################################
+stages:
+  - terraform-init
+  - terraform-scan
+  - terraform-plan
+  - terraform-cost
+  - terraform-visual
+  - terraform-apply
+
+######################### Pipeline trigger rules ###################
+# Only create a pipeline at all for the branches we actually deploy.
+workflow:
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "dev" || $CI_COMMIT_BRANCH == "qa" || $CI_COMMIT_BRANCH == "main"'
+
+######################### Reusable snippets ########################
+# NOTE: kept separate from .common so it can be composed with `extends:`
+# instead of a YAML merge-key (`<<:`) list — see explanation below.
+.aws_auth:
+  before_script:
+    - export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID}"
+    - export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY}"
+    # TODO (recommended): replace static keys with GitLab OIDC + `sts:AssumeRoleWithWebIdentity`.
+    # See the id_tokens example at the bottom of this file.
+
+.common:
+  extends: .aws_auth
+  dependencies: []
+  environment:
+    name: "$TF_ENV_NAME"
+  # Prevents two pipelines from applying to the same environment concurrently.
+  resource_group: "$TF_ENV_NAME"
+  cache:
+    key: "tf-$TF_ENV_NAME"
+    paths:
+      - terraform/.terraform
+    policy: pull-push
+  artifacts:
+    name: "tfplan-$TF_ENV_NAME-$CI_PIPELINE_ID"
+    paths:
+      - terraform/
+    expire_in: 4 hrs
+
+########################### Terraform job templates #################
+.terraform-init:
+  extends: .common
+  stage: terraform-init
+  script:
+    - mkdir -p terraform
+    - cd terraform
+    - terraform init --from-module="${TF_VAR_blueprint_url}" --reconfigure
+
+.terraform-validate:
+  extends: .common
+  stage: terraform-scan
+  script:
+    - cd terraform
+    - kics scan -q /opt/kics/assets/queries -p . -o validation.html
+  artifacts:
+    paths:
+      - terraform/validation.html
+    expire_in: 4 hrs
+    when: always
+
+.terraform-plan:
+  extends: .common
+  stage: terraform-plan
+  script:
+    - cd terraform
+    - terraform plan --var-file="../${TF_ENV_NAME}.tfvars" -out=main.plan
+
+.terraform-cost:
+  extends: .common
+  stage: terraform-cost
+  allow_failure: true   # informational — shouldn't block a deploy
+  script:
+    - cd terraform
+    - infracost configure set api_key "${INFRA_COST_KEY}"
+    - infracost breakdown --path main.plan --format html --out-file report.html
+  artifacts:
+    paths:
+      - terraform/report.html
+    expire_in: 4 hrs
+    when: always
+
+.terraform-visual:
+  extends: .common
+  stage: terraform-visual
+  allow_failure: true   # informational — shouldn't block a deploy
+  script:
+    - cd terraform
+    - rover -standalone
+  artifacts:
+    paths:
+      - terraform/rover.html
+    expire_in: 4 hrs
+    when: always
+
+.terraform-apply:
+  extends: .common
+  stage: terraform-apply
+  script:
+    - cd terraform
+    - terraform apply -auto-approve main.plan
+  when: manual
+  allow_failure: false
+
+########################### Dev ######################################
+terraform-init-dev:
+  extends: .terraform-init
+  variables:
+    TF_ENV_NAME: dev
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "dev"'
+
+terraform-validate-dev:
+  extends: .terraform-validate
+  variables:
+    TF_ENV_NAME: dev
+  needs: ["terraform-init-dev"]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "dev"'
+
+terraform-plan-dev:
+  extends: .terraform-plan
+  variables:
+    TF_ENV_NAME: dev
+  needs: ["terraform-validate-dev"]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "dev"'
+
+terraform-cost-dev:
+  extends: .terraform-cost
+  variables:
+    TF_ENV_NAME: dev
+  needs: ["terraform-plan-dev"]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "dev"'
+
+terraform-visual-dev:
+  extends: .terraform-visual
+  variables:
+    TF_ENV_NAME: dev
+  needs: ["terraform-plan-dev"]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "dev"'
+
+terraform-apply-dev:
+  extends: .terraform-apply
+  variables:
+    TF_ENV_NAME: dev
+  needs: ["terraform-cost-dev", "terraform-visual-dev"]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "dev"'
+
+########################### QA #######################################
+terraform-init-qa:
+  extends: .terraform-init
+  variables:
+    TF_ENV_NAME: qa
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "qa"'
+
+terraform-validate-qa:
+  extends: .terraform-validate
+  variables:
+    TF_ENV_NAME: qa
+  needs: ["terraform-init-qa"]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "qa"'
+
+terraform-plan-qa:
+  extends: .terraform-plan
+  variables:
+    TF_ENV_NAME: qa
+  needs: ["terraform-validate-qa"]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "qa"'
+
+terraform-cost-qa:
+  extends: .terraform-cost
+  variables:
+    TF_ENV_NAME: qa
+  needs: ["terraform-plan-qa"]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "qa"'
+
+terraform-visual-qa:
+  extends: .terraform-visual
+  variables:
+    TF_ENV_NAME: qa
+  needs: ["terraform-plan-qa"]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "qa"'
+
+terraform-apply-qa:
+  extends: .terraform-apply
+  variables:
+    TF_ENV_NAME: qa
+  needs: ["terraform-cost-qa", "terraform-visual-qa"]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "qa"'
+
+########################### Prod #####################################
+terraform-init-prod:
+  extends: .terraform-init
+  variables:
+    TF_ENV_NAME: prod
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+terraform-validate-prod:
+  extends: .terraform-validate
+  variables:
+    TF_ENV_NAME: prod
+  needs: ["terraform-init-prod"]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+terraform-plan-prod:
+  extends: .terraform-plan
+  variables:
+    TF_ENV_NAME: prod
+  needs: ["terraform-validate-prod"]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+terraform-cost-prod:
+  extends: .terraform-cost
+  variables:
+    TF_ENV_NAME: prod
+  needs: ["terraform-plan-prod"]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+terraform-visual-prod:
+  extends: .terraform-visual
+  variables:
+    TF_ENV_NAME: prod
+  needs: ["terraform-plan-prod"]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+terraform-apply-prod:
+  extends: .terraform-apply
+  variables:
+    TF_ENV_NAME: prod
+  needs: ["terraform-cost-prod", "terraform-visual-prod"]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+########################### OIDC example (recommended) ###############
+# Uncomment and adapt once an IAM role with a trust policy for GitLab's
+# OIDC provider exists in each target account, then drop the static
+# AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY CI/CD variables entirely.
+#
+# terraform-init-dev:
+#   id_tokens:
+#     AWS_ID_TOKEN:
+#       aud: https://gitlab.com
+#   before_script:
+#     - >
+#       export $(aws sts assume-role-with-web-identity
+#       --role-arn "${AWS_ROLE_ARN_DEV}"
+#       --role-session-name "gitlab-${CI_PIPELINE_ID}"
+#       --web-identity-token "${AWS_ID_TOKEN}"
+#       --duration-seconds 3600
+#       --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]'
+#       --output text | awk '{printf "AWS_ACCESS_KEY_ID=%s\nAWS_SECRET_ACCESS_KEY=%s\nAWS_SESSION_TOKEN=%s\n", $1, $2, $3}')

@@ -1,0 +1,127 @@
+---
+variables:
+  IMAGE_HELM: "omvedi25/chart-testing:v0.2"
+  IMAGE_HELM_PUSH: "omvedi25/helm-push:v1"
+  HELM_CHART_PATH: "."
+  IMAGE_TEST_DOCS: "omvedi25/helm"
+  IMAGE_HELM_CHART_LINT: "omvedi25/chart-testing:v0.2"
+  IMAGE_PLUTO: "omvedi25/pluto:v5.15.0"
+  IMAGE_GITLAB_RELEASE: "omvedi25/helm"
+  REPO_URL: "http://chartmuseum.homecluster.store:6201"
+  KUBERNETES_VERSION: v1.24.0
+  K8S_VERSIONS_CHECKS: "v1.23.0 v1.24.0 v1.25.0 v1.26.0 v1.27.0"
+  CERT_MANAGER_VERSION: v1.8.0
+  ISTIO_VERSION: v1.13.0
+
+stages:
+  - pretest
+  - lint
+  - test
+  - build
+  - make_release
+  - publish
+
+#.tags_build: &tags_build
+#  tags:
+#    - docker
+#    - guild
+#    - helm
+
+#.patch_version_from_git: &patch_version_from_git
+#  before_script:
+    # Set chart version from git
+#    - VERSION=$(echo $(git describe --tags 2>/dev/null || echo "0.0.1-beta0") | sed 's#^v\(.*\)#\1#')
+#    - "sed -i 's#^version:.*#version: '${VERSION}'#' ${HELM_CHART_PATH}/Chart.yaml"
+
+pretest:deprecated_apis:
+  image:
+    name: ${IMAGE_HELM}
+  stage: pretest
+  script:
+    - cd "${HELM_CHART_PATH}"
+    - helm template ${CHART} . -f test/pluto/values.yaml > pluto.yaml
+  artifacts:
+    paths:
+      - "${HELM_CHART_PATH}/pluto.yaml"
+  #<<: *tags_build
+
+lint:helm:
+  image: ${IMAGE_HELM_CHART_LINT}
+  stage: lint
+  #<<: *patch_version_from_git
+  script:
+    - cd "${HELM_CHART_PATH}"
+    - ct lint --charts . --config ct.yaml
+  only:
+    refs:
+      - main
+      #- branches
+      #- merge_requests
+    changes:
+      - "${HELM_CHART_PATH}/*.yaml"
+      - "${HELM_CHART_PATH}/resources/**/*"
+      - "${HELM_CHART_PATH}/templates/**/*"
+  #<<: *tags_build
+
+test:deprecated_apis:
+  image:
+    name: ${IMAGE_PLUTO}
+  stage: test
+  script:
+     - |
+       cd "${HELM_CHART_PATH}"
+       if [[ ! -z "${K8S_VERSIONS_CHECKS}" ]]; then
+        for ver in ${K8S_VERSIONS_CHECKS}; do
+          echo "Check K8s Version ${ver}"
+          pluto detect pluto.yaml -o yaml --ignore-deprecations -t "k8s=${ver},cert-manager=${CERT_MANAGER_VERSION},istio=${ISTIO_VERSION}"
+        done
+       fi
+  dependencies:
+    - pretest:deprecated_apis
+  #<<: *tags_build
+
+#test:docs:
+#  image: ${IMAGE_TEST_DOCS}
+#  stage: test
+#  <<: *patch_version_from_git
+#  script:
+#    - cd "${HELM_CHART_PATH}"
+#    # Chart version is managed with git, so inject version into Chart.yaml from README in order to diff generate README
+#    - VERSION=$(grep -e "\[Version:.[0-9A-Za-z.-]*" -o README.md | awk '{print $2}')
+#    - "sed -i 's#^version:.*#version: '${VERSION}'#' Chart.yaml"
+#    - helm-docs -d | diff README.md -
+#  only:
+#    refs:
+#      - master
+#      - branches
+#      - merge_requests
+#  #<<: *tags_build
+
+
+build:helm:
+  image: "${IMAGE_HELM_CHART_LINT}"
+  stage: build
+  artifacts:
+    paths:
+      - ${HELM_CHART_PATH}/${CHART}-*.tgz
+#    reports:
+#      dotenv: variables.env 
+  #<<: *patch_version_from_git
+  script:
+    - cd "${HELM_CHART_PATH}"
+    - helm package .
+#    - VERSION=$(grep -e "\[Version:.[0-9A-Za-z.-]*" -o README.md | awk '{print $2}')
+#    - echo "TAG=$(echo $VERSION | cut -d"-" -f 1,2,3)" >> $CI_PROJECT_DIR/variables.env 
+  #<<: *tags_build
+
+
+publish:helm:
+  image: "${IMAGE_HELM_PUSH}"
+  stage: publish
+  dependencies:
+    - build:helm
+  #<<: *patch_version_from_git
+  script:
+    - cd "${HELM_CHART_PATH}"
+    - ls -l
+    - helm cm-push -u ${helm_username} -p ${helm_password} *.tgz  ${REPO_URL}
