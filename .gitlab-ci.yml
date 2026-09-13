@@ -1,0 +1,210 @@
+######################### Default image #########################
+default:
+  image: gradle:8-jdk17
+  interruptible: true
+
+######################### Global Variables #######################
+variables:
+  JFROG_URL: "https://yourco.jfrog.io/artifactory"
+  DOCKER_SNAPSHOT_REPO: "myapp-docker-snapshot-local"
+  DOCKER_RELEASE_REPO: "myapp-docker-release-local"
+  IMAGE_NAME: "myapp"
+  SONAR_HOST_URL: "https://sonarqube.yourco.internal"
+  DAST_TARGET_URL: "https://myapp-staging.yourco.internal"
+
+######################### Stages ##################################
+stages:
+  - build
+  - sast
+  - test
+  - package
+  - dast
+  - publish-snapshot
+  - tag-release
+  - publish-release
+  - release-notes
+
+######################### Pipeline trigger rules ###################
+# Two pipeline shapes only:
+#  - a merge request pipeline (feature branch -> MR against main)
+#  - a branch pipeline on main itself, which only fires right after a merge
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+######################### Reusable snippets ########################
+.on_mr:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+.on_main:
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+.jfrog_auth:
+  before_script:
+    - export JFROG_CLI_OFFER_CONFIG=false
+    - jf c add myco --url="${JFROG_URL}" --access-token="${JFROG_ACCESS_TOKEN}" --interactive=false
+
+######################### Build & unit test #########################
+build:
+  stage: build
+  extends: .on_mr
+  script:
+    - ./gradlew clean build -x test
+  artifacts:
+    paths:
+      - build/libs/*.jar
+    expire_in: 4 hrs
+
+unit-integration-test:
+  stage: test
+  extends: .on_mr
+  needs: ["build"]
+  script:
+    - ./gradlew test integrationTest jacocoTestReport
+  artifacts:
+    when: always
+    reports:
+      junit: build/test-results/test/*.xml
+    paths:
+      - build/reports/jacoco
+    expire_in: 4 hrs
+
+######################### SAST (every MR) ############################
+sast-sonarqube:
+  stage: sast
+  extends: .on_mr
+  needs: ["build"]
+  script:
+    - >
+      ./gradlew sonar
+      -Dsonar.host.url="${SONAR_HOST_URL}"
+      -Dsonar.login="${SONAR_TOKEN}"
+      -Dsonar.projectKey="${CI_PROJECT_PATH_SLUG}"
+      -Dsonar.qualitygate.wait=true
+  allow_failure: false
+
+######################### Package: build & push snapshot image #######
+package-image:
+  stage: package
+  extends: .on_mr
+  needs: ["unit-integration-test"]
+  image: docker:24
+  services:
+    - docker:24-dind
+  variables:
+    SNAPSHOT_TAG: "${IMAGE_NAME}:${CI_COMMIT_REF_SLUG}-${CI_COMMIT_SHORT_SHA}"
+  script:
+    - docker build -t "${SNAPSHOT_TAG}" .
+    - docker save "${SNAPSHOT_TAG}" -o image.tar
+  artifacts:
+    paths:
+      - image.tar
+    expire_in: 4 hrs
+
+######################### DAST against a running instance of the image #
+dast-zap:
+  stage: dast
+  extends: .on_mr
+  needs: ["package-image"]
+  image: ghcr.io/zaproxy/zaproxy:stable
+  allow_failure: true   # informational — flags issues without blocking the MR by default; flip to false once your app is hardened
+  script:
+    - zap-baseline.py -t "${DAST_TARGET_URL}" -r dast-report.html -I
+  artifacts:
+    paths:
+      - dast-report.html
+    expire_in: 4 hrs
+    when: always
+
+######################### Push snapshot image to JFrog (MR only) #####
+publish-snapshot:
+  stage: publish-snapshot
+  extends: [.on_mr, .jfrog_auth]
+  needs: ["package-image", "sast-sonarqube"]
+  image: releases-docker.jfrog.io/jfrog/jfrog-cli-v2:latest
+  variables:
+    SNAPSHOT_TAG: "${IMAGE_NAME}:${CI_COMMIT_REF_SLUG}-${CI_COMMIT_SHORT_SHA}"
+  script:
+    - docker load -i image.tar
+    - docker tag "${SNAPSHOT_TAG}" "${JFROG_URL}/${DOCKER_SNAPSHOT_REPO}/${SNAPSHOT_TAG}"
+    - jf docker push "${JFROG_URL}/${DOCKER_SNAPSHOT_REPO}/${SNAPSHOT_TAG}"
+  environment:
+    name: snapshot
+
+######################### On merge to main: cut the release tag ######
+tag-release:
+  stage: tag-release
+  extends: .on_main
+  script:
+    - |
+      LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+      IFS='.' read -r MAJOR MINOR PATCH <<< "${LAST_TAG#v}"
+      NEW_TAG="v${MAJOR}.${MINOR}.$((PATCH + 1))"
+      echo "Last tag: ${LAST_TAG} -> New tag: ${NEW_TAG}"
+      git config user.email "ci-bot@yourco.com"
+      git config user.name "ci-bot"
+      git tag -a "${NEW_TAG}" -m "Release ${NEW_TAG}"
+      git push "https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" "${NEW_TAG}"
+      echo "RELEASE_TAG=${NEW_TAG}" >> release.env
+  artifacts:
+    reports:
+      dotenv: release.env
+
+######################### Build & push the release image #############
+publish-release:
+  stage: publish-release
+  extends: [.on_main, .jfrog_auth]
+  needs: ["tag-release"]
+  image: docker:24
+  services:
+    - docker:24-dind
+  script:
+    - docker build -t "${IMAGE_NAME}:${RELEASE_TAG}" .
+    - docker tag "${IMAGE_NAME}:${RELEASE_TAG}" "${JFROG_URL}/${DOCKER_RELEASE_REPO}/${IMAGE_NAME}:${RELEASE_TAG}"
+    - jf docker push "${JFROG_URL}/${DOCKER_RELEASE_REPO}/${IMAGE_NAME}:${RELEASE_TAG}"
+  environment:
+    name: release
+
+######################### Release notes + GitLab Release #############
+release-notes:
+  stage: release-notes
+  extends: .on_main
+  needs: ["publish-release"]
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache git curl
+  script:
+    - |
+      PREV_TAG=$(git describe --tags --abbrev=0 "${RELEASE_TAG}^" 2>/dev/null || echo "")
+      {
+        echo "## Release notes — ${RELEASE_TAG}"
+        echo ""
+        echo "Image: ${JFROG_URL}/${DOCKER_RELEASE_REPO}/${IMAGE_NAME}:${RELEASE_TAG}"
+        echo ""
+        echo "### Changes"
+        if [ -n "$PREV_TAG" ]; then
+          git log "${PREV_TAG}..${RELEASE_TAG}" --pretty=format:"- %s (%h)"
+        else
+          echo "_No previous tag found — showing full history._"
+          git log --pretty=format:"- %s (%h)"
+        fi
+      } > release-notes.md
+    - cat release-notes.md
+  artifacts:
+    paths:
+      - release-notes.md
+    expire_in: never
+
+create-gitlab-release:
+  stage: release-notes
+  extends: .on_main
+  needs: ["release-notes"]
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  script:
+    - echo "Publishing GitLab Release ${RELEASE_TAG}"
+  release:
+    tag_name: '${RELEASE_TAG}'
+    description: './release-notes.md'
