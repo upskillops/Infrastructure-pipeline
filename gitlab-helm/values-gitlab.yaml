@@ -1,0 +1,128 @@
+# GitLab Helm chart values - environments/prod EKS cluster
+# helm repo add gitlab https://charts.gitlab.io/
+# helm install gitlab gitlab/gitlab -f values-gitlab.yaml -n gitlab --create-namespace --timeout 600s
+#
+# Assumes:
+#   - cert-manager is already installed in-cluster (add it if not - see README note below)
+#   - EBS CSI driver + its IRSA role already exist (module.eks.ebs_csi in the terraform repo)
+#   - You'll swap the REPLACE_ME values below for your real RDS/ElastiCache/S3/DNS details
+global:
+  hosts:
+    domain: REPLACE_ME.example.com          # gitlab.<domain>, registry.<domain>, etc. are derived from this
+    https: true
+
+  ingress:
+    configureCertmanager: true
+    class: nginx
+    annotations:
+      cert-manager.io/cluster-issuer: letsencrypt-prod
+
+  # ---- External PostgreSQL (use the `rds` module's aws_db_instance instead of the bundled chart) ----
+  psql:
+    host: REPLACE_ME-rds-endpoint.rds.amazonaws.com   # module.rds.endpoint (strip the :5432 port)
+    port: 5432
+    password:
+      secret: gitlab-postgres-password
+      key: password
+    database: gitlabhq_production
+    username: gitlab
+
+  # ---- External Redis (use the `elasticache` module instead of the bundled chart) ----
+  redis:
+    host: REPLACE_ME-redis-primary.cache.amazonaws.com # module.elasticache.primary_endpoint_address
+    port: 6379
+    password:
+      enabled: false        # set true + secret/key below if AUTH is enabled on the replication group
+      # secret: gitlab-redis-password
+      # key: password
+
+  # ---- Object storage: GitLab needs S3 buckets for artifacts/uploads/LFS/registry/backups ----
+  # Create these buckets + an IRSA role with s3:GetObject/PutObject/DeleteObject/ListBucket
+  # scoped to them (same IRSA pattern as module.eks's ebs_csi role) - not yet in the terraform
+  # repo; ask if you want that module added.
+  appConfig:
+    object_store:
+      enabled: true
+      proxy_download: true
+      connection:
+        secret: gitlab-object-storage
+        key: connection
+    artifacts:
+      bucket: REPLACE_ME-gitlab-artifacts
+    lfs:
+      bucket: REPLACE_ME-gitlab-lfs
+    uploads:
+      bucket: REPLACE_ME-gitlab-uploads
+    packages:
+      bucket: REPLACE_ME-gitlab-packages
+    backups:
+      bucket: REPLACE_ME-gitlab-backups
+
+# ---- Disable bundled dependencies we're replacing with managed AWS services ----
+postgresql:
+  install: false
+
+redis:
+  install: false
+
+minio:
+  enabled: false
+
+# ---- Registry: also backed by S3 (uses global.appConfig object_store style config) ----
+registry:
+  enabled: true
+
+# ---- gitlab-shell (SSH git clone) - exposed via its own LoadBalancer (NLB), kept
+# separate from HTTP ingress since SSH can't go through an L7 ingress ----
+gitlab-shell:
+  service:
+    type: LoadBalancer
+    annotations:
+      service.beta.kubernetes.io/aws-load-balancer-type: "external"
+      service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "ip"
+      service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+
+# ---- NGINX ingress controller bundled with the chart, fronted by its own NLB.
+# Kept independent of the Istio mesh used elsewhere in this cluster - GitLab's
+# many components (webservice, registry, pages, ssh, mailroom) are easiest to
+# run outside the mesh; see README note if you'd rather route it through Istio. ----
+nginx-ingress:
+  enabled: true
+  controller:
+    service:
+      type: LoadBalancer
+      annotations:
+        service.beta.kubernetes.io/aws-load-balancer-type: "external"
+        service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "ip"
+        service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+
+certmanager:
+  install: false   # set true only if you don't already run cert-manager cluster-wide
+
+# ---- Right-size for a first install on m6i.large nodes (2 vCPU / 8GB each).
+# GitLab's stock defaults assume a much larger reference architecture -
+# trim replica counts/requests here, then scale up once it's running. ----
+gitlab:
+  webservice:
+    minReplicas: 1
+    maxReplicas: 2
+    resources:
+      requests:
+        cpu: 300m
+        memory: 1.5Gi
+  sidekiq:
+    minReplicas: 1
+    maxReplicas: 2
+    resources:
+      requests:
+        cpu: 200m
+        memory: 800Mi
+  toolbox:
+    resources:
+      requests:
+        cpu: 100m
+        memory: 500Mi
+  gitaly:
+    persistence:
+      size: 50Gi
+      storageClass: gp3   # requires a gp3 StorageClass backed by the EBS CSI driver
