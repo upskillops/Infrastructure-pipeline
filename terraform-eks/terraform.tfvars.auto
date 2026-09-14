@@ -1,0 +1,41 @@
+###############################################################################
+# Example terraform.tfvars – adjust before applying
+###############################################################################
+
+aws_region      = "us-east-1"
+cluster_name    = "private-eks-fargate"
+cluster_version = "1.35"
+
+vpc_cidr             = "10.0.0.0/16"
+availability_zones   = ["us-east-1a", "us-east-1b", "us-east-1c"]
+private_subnet_cidrs = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
+public_subnet_cidrs  = ["10.0.101.0/24", "10.0.102.0/24", "10.0.103.0/24"]
+single_nat_gateway   = false   # true = cheaper, false = HA
+
+# Set to true + add your CIDR below if you need kubectl from the internet
+endpoint_public_access = false
+public_access_cidrs    = []
+
+cluster_log_types = ["api", "audit", "authenticator", "controllerManager", "scheduler"]
+
+fargate_profiles = {
+  kube-system = {
+    namespace = "kube-system"
+    labels    = {}
+  }
+  default = {
+    namespace = "default"
+    labels    = {}
+  }
+  app = {
+    namespace = "app"
+    labels    = { workload = "fargate" }
+  }
+}
+
+common_tags = {
+  Terraform   = "true"
+  Environment = "production"
+  Project     = "eks-fargate"
+  Owner       = "platform-team"
+}
