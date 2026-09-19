@@ -274,6 +274,92 @@ variable "enable_ebs_csi_driver" {
   default     = true
 }
 
+variable "storage_classes" {
+  description = <<-EOT
+    StorageClasses to create, one per workload tier. See the comment block in
+    modules/cluster-addons: a class is not bound to a node group -- it
+    volume is provisioned, not where the pod runs. Tiering them buys
+    per-workload tuning and reclaim behaviour, and the WaitForFirstConsumer
+    binding mode (set on all of them) is what keeps the volume in the AZ the
+    tier scheduled in.
+
+    Exactly one entry must set default = true.
+
+    Not created via the aws-ebs-csi-driver addon's own defaultStorageClass
+    option: that one is hardcoded to the name "ebs-csi-default-sc" and emits
+    no parameters block at all, so it cannot set encrypted, type, iops or
+    throughput. On an account without EBS encryption-by-default -- which this
+    one is -- that silently gives you plaintext volumes.
+  EOT
+
+  type = map(object({
+    tier                   = optional(string)
+    type                   = optional(string, "gp3")
+    iops                   = optional(number)
+    throughput             = optional(number)
+    encrypted              = optional(bool, true)
+    kms_key_id             = optional(string)
+    reclaim_policy         = optional(string, "Delete")
+    allow_volume_expansion = optional(bool, true)
+    default                = optional(bool, false)
+  }))
+
+  default = {
+    # Cluster default, for anything that does not name a class. gp3 baseline
+    # performance (3000 IOPS / 125 MiB/s), which is free.
+    gp3 = {
+      tier    = "shared"
+      default = true
+    }
+
+    # Gitaly. Retain because this volume holds your git repositories: if the
+    # PVC is ever deleted -- a bad helm upgrade, a namespace wipe -- the data
+    # has to survive. Recovering it is then a manual PV rebind rather than a
+    # restore from backup.
+    gp3-infra = {
+      tier           = "infra"
+      iops           = 4000
+      throughput     = 250
+      reclaim_policy = "Retain"
+    }
+
+    # Prometheus and Loki. The heaviest disk users in the cluster: Loki's
+    # chunk flushes and Prometheus' WAL compaction are both throughput-bound,
+    # so this is the one tier where paying above gp3 baseline is worth it.
+    # Delete, not Retain -- metrics are regenerable and orphaned 150 GiB
+    # volumes are pure cost.
+    gp3-monitoring = {
+      tier       = "monitoring"
+      iops       = 6000
+      throughput = 500
+    }
+
+    # General application PVCs. Baseline gp3; raise per-app if something
+    # turns out to be disk-bound.
+    gp3-app = {
+      tier = "app"
+    }
+  }
+
+  validation {
+    condition     = length([for k, v in var.storage_classes : k if v.default]) == 1
+    error_message = "Exactly one entry in storage_classes must set default = true."
+  }
+
+  validation {
+    condition = alltrue([
+      for k, v in var.storage_classes : contains(["Delete", "Retain"], v.reclaim_policy)
+    ])
+    error_message = "reclaim_policy must be \"Delete\" or \"Retain\"."
+  }
+}
+
+variable "gitlab_storage_class" {
+  description = "StorageClass for Gitaly's repository volume. Must be a key in storage_classes. Defaults to the infra tier's class, which is the one with reclaim_policy = Retain -- this volume holds your git repositories."
+  type        = string
+  default     = "gp3-infra"
+}
+
 ###############################################################################
 # Existing-cluster path only
 ###############################################################################
@@ -402,4 +488,52 @@ variable "gitlab_runner_helper_image" {
   EOT
   type        = string
   default     = "registry.gitlab.com/gitlab-org/gitlab-runner/gitlab-runner-helper:arm64-v19.3.2"
+}
+
+###############################################################################
+# Install method: Terraform-managed Helm releases vs. plain `helm` commands
+#
+# "terraform" keeps the helm_release resources in this configuration, which is
+# the original behaviour: one `terraform apply` builds everything.
+#
+# "helm" (the default) makes Terraform build only the AWS side -- VPC, cluster,
+# node groups, IAM roles, RDS, ElastiCache, S3, Route53 -- and leaves the chart
+# itself to the vendored charts and scripts in ../helm-charts. Upgrades,
+# rollbacks and `helm diff` then work the way they normally do, instead of
+# every chart value change being a terraform plan.
+#
+# NOTE the consequence for Cilium: with "helm", nothing installs a CNI during
+# the apply, so joining nodes stay NotReady and the managed node group cannot
+# reach ACTIVE on its own. That is intentional -- it is the NotReady window the
+# operator installs Cilium into -- but it means the apply BLOCKS until Cilium
+# is installed out of band. Use helm-charts/bin/bootstrap.sh, which runs the
+# apply and the Cilium install together, or keep a second terminal ready.
+###############################################################################
+
+variable "cilium_install_method" {
+  description = "\"helm\" = Terraform creates the cilium-operator IRSA role but not the release; install the vendored chart with helm-charts/bin/install-cilium.sh. \"terraform\" = the helm_release stays in this configuration."
+  type        = string
+  default     = "helm"
+
+  validation {
+    condition     = contains(["helm", "terraform"], var.cilium_install_method)
+    error_message = "cilium_install_method must be \"helm\" or \"terraform\"."
+  }
+}
+
+variable "gitlab_install_method" {
+  description = "\"helm\" = Terraform provisions RDS/ElastiCache/S3/Route53/IRSA but not the GitLab release, namespace or secrets; install with helm-charts/bin/install-gitlab.sh. \"terraform\" = the helm_release stays in this configuration."
+  type        = string
+  default     = "helm"
+
+  validation {
+    condition     = contains(["helm", "terraform"], var.gitlab_install_method)
+    error_message = "gitlab_install_method must be \"helm\" or \"terraform\"."
+  }
+}
+
+variable "node_group_create_timeout" {
+  description = "Override the managed node group create timeout. Left null it is 20m when Cilium is installed by Terraform (a node that is not Ready by then is a real failure) and 45m when Cilium is installed by Helm (the apply has to sit through the NotReady window while the operator runs the install)."
+  type        = string
+  default     = null
 }

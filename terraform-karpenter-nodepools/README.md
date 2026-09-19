@@ -6,22 +6,41 @@ above them.
 
 ```
 .
+├── main.tf           # composition ONLY -- wires the modules together
 ├── vpc.tf            # VPC, public/private subnets, NAT per AZ
 ├── eks.tf            # EKS control plane ONLY (no compute -- see below)
-├── cilium.tf         # Cilium: replaces VPC CNI *and* kube-proxy
 ├── nodegroups.tf     # 4 Graviton managed node groups (the per-tier floor)
-├── addons.tf         # CoreDNS, Pod Identity agent, EBS CSI + gp3 StorageClass
 ├── karpenter.tf      # Karpenter controller (burst above the floor)
-├── main.tf           # the 3 Karpenter NodePools
 ├── providers.tf      # exec-based EKS auth
-├── aws-lbc.tf        # AWS Load Balancer Controller (NLB for the GitLab Gateway)
-├── gitlab.tf              # GitLab + bundled Runner Helm release
-├── gitlab-datastores.tf   # RDS PostgreSQL 17 + ElastiCache Redis (Graviton)
-├── gitlab-storage.tf      # 12 S3 buckets + IRSA
-├── gitlab-dns.tf          # Route53 zone + external-dns
+├── variables.tf outputs.tf versions.tf
 ├── iam-existing-cluster.tf   # node IAM role, only when create_cluster = false
-└── modules/karpenter-nodepool/   # 1 EC2NodeClass + 1 NodePool
+└── modules/
+    ├── cilium/              # sole CNI: replaces VPC CNI *and* kube-proxy
+    ├── cluster-addons/      # CoreDNS, Pod Identity, EBS CSI, StorageClasses
+    ├── ingress/             # AWS LB Controller, external-dns, Route53 zone
+    ├── gitlab/              # RDS + ElastiCache + 12 S3 buckets + the release
+    └── karpenter-nodepool/  # 1 EC2NodeClass + 1 NodePool
 ```
+
+VPC, EKS and the Karpenter controller are direct calls to upstream
+`terraform-aws-modules` — deliberately not wrapped again in a local module,
+which would only add a layer of variable passthrough.
+
+Ordering between the modules is the whole point of the design, so `main.tf`
+states it explicitly with `depends_on` rather than leaving it to be inferred:
+
+```
+vpc → eks → [cilium] → node groups → cluster-addons → ingress → gitlab
+                                            └→ karpenter → nodepools
+```
+
+The brackets around cilium are deliberate: under the default
+`cilium_install_method = "helm"` that module creates only an IAM role, and the
+CNI arrives out of band while the node groups block. See `../helm-charts`.
+
+One consequence of the module split worth knowing: inside a module there is no
+`count = enabled ? 1 : 0` on every resource, because the caller gates the whole
+module block. That removed several hundred `[0]` index expressions.
 
 ## Tiers
 
@@ -174,7 +193,7 @@ browser ──HTTPS──> NLB (AWS LB Controller, ip targets)
 
 - **PostgreSQL, Redis and object storage are no longer bundled.** Chart v10.0.0
   deleted those subcharts and refuses to render without external ones. They are
-  provisioned in `gitlab-datastores.tf` and `gitlab-storage.tf`.
+  provisioned in `modules/gitlab/datastores.tf` and `modules/gitlab/storage.tf`.
 - **PostgreSQL 17 is the floor.** The chart's own NOTES.txt states it; PG 16
   fails the migration job.
 - **Ingress is Gateway API, not nginx.** The chart ships Envoy Gateway and

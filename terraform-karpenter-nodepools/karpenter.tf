@@ -80,9 +80,11 @@ resource "helm_release" "karpenter" {
     })
   ]
 
+  # cluster_addons carries both the CoreDNS addon (the controller needs DNS)
+  # and the Pod Identity agent (which is how the v21 submodule authenticates
+  # the controller -- without it Karpenter cannot call EC2 at all).
   depends_on = [
     module.karpenter,
-    aws_eks_addon.coredns,
-    aws_eks_addon.pod_identity,
+    module.cluster_addons,
   ]
 }

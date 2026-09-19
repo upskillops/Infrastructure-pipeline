@@ -18,6 +18,30 @@ create_cluster = true
 # cluster_endpoint_public_access_cidrs = ["0.0.0.0/0"]
 
 ###############################################################################
+# Who installs the charts
+#
+# Both default to "helm": Terraform builds the AWS side, and Cilium and GitLab
+# are installed from the vendored charts in ../helm-charts with plain helm
+# commands, so `helm diff` / `history` / `rollback` work on them.
+#
+# Consequence for Cilium: no CNI is installed during the apply, so nodes join
+# NotReady and the apply BLOCKS until Cilium is installed out of band. Run
+# ../helm-charts/bin/bootstrap.sh, which does the apply and the Cilium install
+# together, or keep a second terminal ready for
+# ../helm-charts/bin/install-cilium.sh.
+#
+# Set either to "terraform" to go back to a single self-contained apply.
+###############################################################################
+
+# cilium_install_method = "helm"
+# gitlab_install_method = "helm"
+
+# Node group create timeout. Defaults to 20m with cilium_install_method =
+# "terraform" and 45m with "helm" -- the apply has to sit through the NotReady
+# window. Raise it if you are installing Cilium by hand and want more slack.
+# node_group_create_timeout = "45m"
+
+###############################################################################
 # Cilium (sole CNI: replaces both VPC CNI and kube-proxy)
 ###############################################################################
 

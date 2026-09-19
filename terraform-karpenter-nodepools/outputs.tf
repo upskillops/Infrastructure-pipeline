@@ -1,3 +1,7 @@
+###############################################################################
+# Cluster
+###############################################################################
+
 output "cluster_name" {
   value = local.cluster_name
 }
@@ -17,6 +21,10 @@ output "vpc_id" {
 output "private_subnet_ids" {
   value = var.create_cluster ? module.vpc[0].private_subnets : null
 }
+
+###############################################################################
+# Compute
+###############################################################################
 
 output "node_groups" {
   description = "Graviton managed node groups providing each tier's guaranteed floor."
@@ -46,9 +54,13 @@ output "nodegroup_node_role_name" {
   value       = var.create_cluster ? aws_iam_role.node[0].name : null
 }
 
+###############################################################################
+# Cilium
+###############################################################################
+
 output "cilium_operator_role_arn" {
   description = "IRSA role the Cilium operator assumes to manage ENIs."
-  value       = local.install_cilium ? aws_iam_role.cilium_operator[0].arn : null
+  value       = one(module.cilium[*].operator_role_arn)
 }
 
 output "verify_cilium" {
@@ -57,16 +69,28 @@ output "verify_cilium" {
 }
 
 ###############################################################################
+# Storage
+###############################################################################
+
+output "storage_classes" {
+  description = "StorageClasses created, and which one is default."
+  value = var.create_cluster ? {
+    names   = one(module.cluster_addons[*].storage_class_names)
+    default = one(module.cluster_addons[*].default_storage_class)
+  } : null
+}
+
+###############################################################################
 # GitLab
 ###############################################################################
 
 output "gitlab_url" {
   description = "Browser URL for the GitLab UI."
-  value       = local.gitlab_enabled ? "https://gitlab.${var.gitlab_domain}" : null
+  value       = one(module.gitlab[*].url)
 }
 
 output "gitlab_registry_url" {
-  value = local.gitlab_enabled ? "https://registry.${var.gitlab_domain}" : null
+  value = one(module.gitlab[*].registry_url)
 }
 
 output "gitlab_root_password_command" {
@@ -79,25 +103,61 @@ output "gitlab_root_password_command" {
 
 output "gitlab_nameservers" {
   description = "Delegate gitlab_domain to these at your registrar. Until this is done the UI will not resolve and Let's Encrypt cannot issue a certificate."
-  value       = local.gitlab_zone_nameservers
+  value       = try(one(module.ingress[*].route53_zone_nameservers), [])
 }
 
 output "gitlab_db_endpoint" {
-  value     = local.gitlab_enabled ? aws_db_instance.gitlab[0].address : null
+  value     = one(module.gitlab[*].db_endpoint)
   sensitive = true
 }
 
 output "gitlab_redis_endpoint" {
-  value     = local.gitlab_enabled ? aws_elasticache_replication_group.gitlab[0].primary_endpoint_address : null
+  value     = one(module.gitlab[*].redis_endpoint)
   sensitive = true
 }
 
 output "gitlab_buckets" {
   description = "S3 buckets backing GitLab object storage."
-  value       = local.gitlab_bucket_names
+  value       = try(one(module.gitlab[*].buckets), {})
 }
 
 output "gitlab_watch_rollout" {
   description = "GitLab installs asynchronously by default; follow it with this."
   value       = local.gitlab_enabled ? "kubectl -n ${var.gitlab_namespace} get pods -w" : null
+}
+
+###############################################################################
+# Consumed by ../helm-charts/bin/*.sh
+#
+# These names are an interface -- the install scripts read them by name with
+# `terraform output -json`. Renaming one breaks the scripts silently.
+###############################################################################
+
+output "helm_cilium_values" {
+  description = "Substitutions for helm-charts/values/cilium.values.yaml."
+  value = local.install_cilium ? {
+    cluster_name           = local.cluster_name
+    chart_version          = var.cilium_version
+    k8s_service_host       = module.cilium[0].k8s_service_host
+    vpc_cidr               = var.vpc_cidr
+    operator_role_arn      = module.cilium[0].operator_role_arn
+    operator_replicas      = var.cilium_operator_replicas
+    prefix_delegation      = var.cilium_enable_prefix_delegation
+    hubble_relay           = var.cilium_enable_hubble_relay
+    installed_by_terraform = module.cilium[0].installed_by_terraform
+  } : null
+}
+
+output "helm_gitlab_values" {
+  description = "Non-secret substitutions for helm-charts/values/gitlab.values.yaml."
+  value       = one(module.gitlab[*].helm_values)
+}
+
+# Kept separate and marked sensitive so `terraform output` stays readable and
+# the values never land in a shell trace. install-gitlab.sh pipes these
+# straight into `kubectl create secret` without writing them to disk.
+output "helm_gitlab_secrets" {
+  description = "Generated GitLab credentials, for the Kubernetes secrets the chart expects to already exist."
+  sensitive   = true
+  value       = one(module.gitlab[*].helm_secrets)
 }

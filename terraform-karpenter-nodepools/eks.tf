@@ -42,7 +42,8 @@ module "eks" {
   # control plane, so it works during bootstrap.
   enable_irsa = true
 
-  # Addons are created in addons.tf instead, so they can depend on node groups.
+  # Addons are created in modules/cluster-addons instead, so they can depend
+  # on node groups.
   # Left here, CoreDNS would be created immediately after the control plane,
   # sit DEGRADED with nowhere to schedule, and block the apply until it timed out.
   addons = {}

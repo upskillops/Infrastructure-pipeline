@@ -17,24 +17,39 @@ locals {
   create_nodegroups = var.create_cluster
 
   node_groups = local.create_nodegroups ? var.workload_node_groups : {}
+
+  # 20m when Terraform installs Cilium: a node that is not Ready by then is a
+  # genuine failure and should surface fast. 45m when Helm does, because the
+  # apply has to sit in the NotReady window long enough for the operator to
+  # run install-cilium.sh -- the node group only reaches ACTIVE once the agent
+  # has written /etc/cni/net.d and the kubelet reports Ready.
+  # local.cilium_via_terraform is defined in main.tf.
+  node_group_create_timeout = coalesce(
+    var.node_group_create_timeout,
+    local.cilium_via_terraform ? "20m" : "45m",
+  )
 }
 
 # One IAM role shared by all four node groups, rather than four identical roles.
 # Deliberately without AmazonEKS_CNI_Policy: VPC CNI is gone, and under Cilium
-# ENI mode only the cilium-operator role (cilium.tf) may manipulate ENIs.
+# ENI mode only the cilium-operator role (modules/cilium) may manipulate ENIs.
 resource "aws_iam_role" "node" {
   count = local.create_nodegroups ? 1 : 0
 
   name = "${var.cluster_name}-node"
 
   # There is no fallback CNI. Module v21 sets bootstrap_self_managed_addons =
-  # false and addons.tf installs no vpc-cni, so with Cilium disabled a joining
+  # false and modules/cluster-addons installs no vpc-cni, so with Cilium off a
   # node has nothing to make it Ready and every node group would sit until it
   # timed out. Fail at plan time instead of 20 minutes into an apply.
+  #
+  # install_cilium is about *whether* Cilium is the CNI, not who installs it --
+  # cilium_install_method = "helm" still satisfies this, because the chart is
+  # vendored in helm-charts/ and installed during the NotReady window.
   lifecycle {
     precondition {
       condition     = var.install_cilium
-      error_message = "install_cilium must be true when create_cluster is true: Cilium is the only CNI this configuration installs, so disabling it leaves the cluster with no pod networking. To run a different CNI, add it to addons.tf and relax this precondition."
+      error_message = "install_cilium must be true when create_cluster is true: Cilium is the only CNI this configuration installs, so disabling it leaves the cluster with no pod networking. To run a different CNI, add it to modules/cluster-addons and relax this precondition."
     }
   }
 
@@ -123,11 +138,10 @@ module "node_group" {
     http_put_response_hop_limit = 2
   }
 
-  # Well under the 60-minute provider default. A node group that cannot reach
-  # Ready almost always means Cilium is unhealthy, and that should surface in
-  # minutes rather than at the end of an hour-long apply.
+  # See local.node_group_create_timeout: short when Terraform owns the Cilium
+  # install, long enough to cover a manual `helm install` when it does not.
   timeouts = {
-    create = "20m"
+    create = local.node_group_create_timeout
     update = "20m"
     delete = "20m"
   }
@@ -135,9 +149,15 @@ module "node_group" {
   tags = var.tags
 
   # The ordering the whole Cilium design turns on: no node may be created
-  # before a CNI exists to make it Ready. See the comment block in cilium.tf.
+  # before a CNI exists to make it Ready. See the header of modules/cilium.
+  #
+  # Under cilium_install_method = "helm" the module's helm_release has count 0,
+  # so this edge only carries the IAM role -- nodes are created with no CNI on
+  # purpose, join NotReady, and wait for install-cilium.sh. This resource is
+  # then the thing that proves the install worked: it cannot reach ACTIVE
+  # until a node is Ready.
   depends_on = [
-    helm_release.cilium,
+    module.cilium,
     aws_iam_role_policy_attachment.node,
   ]
 }
