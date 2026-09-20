@@ -1,0 +1,244 @@
+###############################################################################
+# GitLab -- chart v10.x, pinned to the managed infra node group, with RDS,
+# ElastiCache and S3 behind it and Envoy Gateway in front.
+#
+# Placeholders are written in SHOUTING_SNAKE_CASE wrapped in double
+# underscores, and are substituted by bin/render-values.sh from
+# `terraform output -json helm_gitlab_values`. Edit anything else here freely --
+# the rendered copy lands in .rendered/ and is what helm actually installs.
+#
+# This file is a transcription of the values block in
+# ../terraform-karpenter-nodepools/modules/gitlab/release.tf.
+# If you change one, change both.
+#
+# Chart v10.0.0 REMOVED the bundled PostgreSQL, Redis and object storage
+# subcharts. All three are external and provisioned by Terraform; the chart
+# will refuse to render if any of them is missing.
+###############################################################################
+
+# Pin GitLab to the *managed* infra nodes rather than the whole infra tier.
+# EKS labels every managed node group node with this automatically. Using it
+# instead of `workload: infra` keeps GitLab off the Karpenter infra pool,
+# which includes spot -- Gitaly owns an EBS volume holding your git
+# repositories and must not be interrupted. CI job pods are the opposite case
+# and are deliberately allowed onto spot (see gitlab-runner at the bottom).
+#
+# An unused top-level key holding a YAML anchor; the chart ignores it and
+# every component below merges it in with `<<:`.
+_infraPlacement: &infraPlacement
+  nodeSelector:
+    eks.amazonaws.com/nodegroup: __INFRA_NODEGROUP__
+  tolerations:
+    - key: workload
+      operator: Equal
+      value: infra
+      effect: NoSchedule
+
+global:
+  <<: *infraPlacement
+
+  edition: ce
+
+  hosts:
+    domain: __DOMAIN__
+    https: true
+
+  # Chart v10 fronts GitLab with Gateway API (Envoy Gateway) rather than an
+  # nginx Ingress. cert-manager and the HTTP->HTTPS redirect are wired up by
+  # the chart itself.
+  gatewayApi:
+    enabled: true
+    installEnvoy: true
+    configureCertmanager: true
+    httpToHttpsRedirect: true
+  ingress:
+    enabled: false
+
+  # --- external PostgreSQL (RDS) ---
+  psql:
+    host: __DB_HOST__
+    port: 5432
+    database: __DB_NAME__
+    username: __DB_USERNAME__
+    password:
+      useSecret: true
+      secret: gitlab-postgres-password
+      key: password
+
+  # --- external Redis (ElastiCache) ---
+  # scheme=rediss because the replication group has transit_encryption_enabled;
+  # without it every connection is refused.
+  redis:
+    host: __REDIS_HOST__
+    port: 6379
+    scheme: rediss
+    auth:
+      enabled: true
+      secret: gitlab-redis-password
+      key: password
+
+  # --- external object storage (S3 via IRSA) ---
+  appConfig:
+    object_store:
+      enabled: true
+      proxy_download: true
+      connection:
+        secret: gitlab-object-storage
+        key: connection
+    artifacts:
+      bucket: __BUCKET_ARTIFACTS__
+    lfs:
+      bucket: __BUCKET_LFS__
+    uploads:
+      bucket: __BUCKET_UPLOADS__
+    packages:
+      bucket: __BUCKET_PACKAGES__
+    externalDiffs:
+      bucket: __BUCKET_EXTERNALDIFFS__
+    ciSecureFiles:
+      bucket: __BUCKET_CISECUREFILES__
+    dependencyProxy:
+      bucket: __BUCKET_DEPENDENCYPROXY__
+    terraformState:
+      bucket: __BUCKET_TERRAFORMSTATE__
+    pages:
+      bucket: __BUCKET_PAGES__
+    backups:
+      bucket: __BUCKET_BACKUPS__
+      tmpBucket: __BUCKET_TMP__
+
+  # IRSA: every GitLab ServiceAccount assumes the S3 role. The trust policy is
+  # scoped to the namespace rather than to individual names, because the chart
+  # creates one ServiceAccount per component.
+  serviceAccount:
+    enabled: true
+    create: true
+    annotations:
+      eks.amazonaws.com/role-arn: __S3_ROLE_ARN__
+
+# Let's Encrypt account for the chart-managed issuer.
+certmanager-issuer:
+  email: __ACME_EMAIL__
+
+# cert-manager ships with the chart; keep its pods on infra too.
+certmanager:
+  installCRDs: true
+  <<: *infraPlacement
+  webhook:
+    <<: *infraPlacement
+  cainjector:
+    <<: *infraPlacement
+  startupapicheck:
+    <<: *infraPlacement
+
+# The Envoy Gateway control plane.
+envoy-gateway:
+  deployment:
+    pod:
+      <<: *infraPlacement
+  # certgen is a Helm hook Job that mints Envoy Gateway's internal certs. It is
+  # the one pod the chart does not cover via global placement, and because it
+  # is a hook the whole release blocks until it completes.
+  certgen:
+    job:
+      <<: *infraPlacement
+
+# This is what turns the Gateway into a browser-reachable endpoint: Envoy
+# Gateway copies these onto the Service it creates, and the AWS Load Balancer
+# Controller turns that into an internet-facing NLB. external-dns then points
+# gitlab.<domain> at it, which is also what lets the HTTP01 challenge succeed.
+gatewayApiResources:
+  gateway:
+    infrastructure:
+      annotations:
+        service.beta.kubernetes.io/aws-load-balancer-type: external
+        service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+        service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+        service.beta.kubernetes.io/aws-load-balancer-name: __CLUSTER_NAME__-gitlab
+
+# Prometheus/Grafana belong on the monitoring tier, not bundled in here.
+prometheus:
+  install: false
+
+# --- component sizing, tuned for m7g.xlarge infra nodes ---
+gitlab:
+  webservice:
+    minReplicas: __WEBSERVICE_MIN_REPLICAS__
+    maxReplicas: __WEBSERVICE_MAX_REPLICAS__
+    resources:
+      requests:
+        cpu: 500m
+        memory: 2Gi
+  sidekiq:
+    minReplicas: __SIDEKIQ_MIN_REPLICAS__
+    maxReplicas: __SIDEKIQ_MAX_REPLICAS__
+    resources:
+      requests:
+        cpu: 400m
+        memory: 1500Mi
+  gitlab-shell:
+    minReplicas: 2
+    maxReplicas: 3
+  toolbox:
+    resources:
+      requests:
+        cpu: 100m
+        memory: 512Mi
+    # Backups run from here; it needs the S3 connection too.
+    backups:
+      objectStorage:
+        config:
+          secret: gitlab-object-storage
+          key: connection
+  gitaly:
+    persistence:
+      size: __GITALY_STORAGE_SIZE__
+      # The infra tier's class. It is the one with reclaimPolicy: Retain --
+      # this volume is where git repositories actually live, so it has to
+      # survive its PVC being deleted.
+      storageClass: __GITALY_STORAGE_CLASS__
+    resources:
+      requests:
+        cpu: 500m
+        memory: 2Gi
+
+registry:
+  enabled: true
+  storage:
+    secret: gitlab-registry-storage
+    key: config
+
+# --- bundled GitLab Runner ---
+# Ships with the chart and self-registers against this GitLab, which avoids the
+# usual chicken-and-egg of needing a registration token from a UI that does not
+# exist yet.
+gitlab-runner:
+  install: true
+
+  # The runner *manager* sits with GitLab on stable on-demand nodes.
+  <<: *infraPlacement
+
+  rbac:
+    create: true
+
+  runners:
+    # CI *job* pods are the ideal spot workload: short-lived and restartable.
+    # Selecting on `workload: infra` (rather than the node group label above)
+    # lets them land on either the managed nodes or the Karpenter infra pool,
+    # which includes spot.
+    config: |
+      [[runners]]
+        [runners.kubernetes]
+          namespace = "{{.Release.Namespace}}"
+          image = "alpine:3.21"
+          cpu_request = "500m"
+          memory_request = "1Gi"
+          helper_image = "__RUNNER_HELPER_IMAGE__"
+          [runners.kubernetes.node_selector]
+            "workload" = "infra"
+            "kubernetes.io/arch" = "arm64"
+          [[runners.kubernetes.node_tolerations]]
+            key = "workload"
+            operator = "Equal"
+            value = "infra"
+            effect = "NoSchedule"

@@ -1,3 +1,13 @@
+> **Superseded by [`../helm-charts/`](../helm-charts/).**
+>
+> This guide describes an earlier design: nginx-ingress, static S3 access
+> keys, a manually created `ClusterIssuer`, and S3 buckets created by hand.
+> The current stack uses Envoy Gateway behind an NLB, IRSA instead of static
+> keys, and Terraform-provisioned RDS / ElastiCache / S3. It also predates
+> GitLab chart v10, which removed the bundled PostgreSQL and Redis.
+>
+> Kept for reference. Follow `helm-charts/README.md` instead.
+
 # Installing GitLab on the EKS cluster
 
 ## 1. Prerequisites

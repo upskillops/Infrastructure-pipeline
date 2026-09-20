@@ -1,0 +1,75 @@
+###############################################################################
+# Cilium -- sole CNI for the EKS cluster, replacing BOTH the VPC CNI and
+# kube-proxy. Installing this chart is what takes the nodes from NotReady to
+# Ready; before it runs there is no /etc/cni/net.d on any node at all.
+#
+# Placeholders are written in SHOUTING_SNAKE_CASE wrapped in double
+# underscores, and are substituted by bin/render-values.sh from
+# `terraform output -json helm_cilium_values`. Edit anything else here freely --
+# the rendered copy lands in .rendered/ and is what helm actually installs.
+#
+# This file is a transcription of the values block in
+# ../terraform-karpenter-nodepools/modules/cilium/main.tf.
+# If you change one, change both.
+###############################################################################
+
+# --- IPAM: real VPC IPs per pod, no overlay ---------------------------------
+# ENI mode means the cilium-operator creates and attaches ENIs and hands
+# addresses out to the agents. Pods get routable VPC addresses, so an
+# ip-target NLB can reach them directly and source IPs survive.
+eni:
+  enabled: true
+  # /28 prefixes per ENI instead of single IPs. Matters here because the
+  # Graviton instance types in use are large and would otherwise hit the
+  # per-ENI IP ceiling long before they run out of CPU or memory.
+  awsEnablePrefixDelegation: __PREFIX_DELEGATION__
+  awsReleaseExcessIPs: true
+  # IRSA. Without this the agent looks for the legacy `cilium-aws` secret and
+  # fails; the role is created by Terraform (aws_iam_role.cilium_operator).
+  iamRole: __OPERATOR_ROLE_ARN__
+
+ipam:
+  mode: eni
+
+routingMode: native
+ipv4NativeRoutingCIDR: __VPC_CIDR__
+endpointRoutes:
+  enabled: true
+egressMasqueradeInterfaces: eth0
+
+# --- kube-proxy replacement -------------------------------------------------
+# There is no kube-proxy on this cluster, so Cilium cannot bootstrap itself
+# through the kubernetes.default ClusterIP -- nothing would translate it. It
+# needs the API server's real address.
+kubeProxyReplacement: "true"
+k8sServiceHost: __K8S_SERVICE_HOST__
+k8sServicePort: 443
+
+cni:
+  # Remove any other CNI conf file rather than chaining with it.
+  exclusive: true
+
+serviceAccounts:
+  operator:
+    name: cilium-operator
+    annotations:
+      eks.amazonaws.com/role-arn: __OPERATOR_ROLE_ARN__
+
+operator:
+  replicas: __OPERATOR_REPLICAS__
+  # Explicit even though it is the chart default. In ENI mode the agent cannot
+  # assign a pod IP until the operator has attached an ENI, but a normal
+  # Deployment needs a pod IP to start -- a deadlock. hostNetwork puts the
+  # operator on the node's own address and breaks it.
+  hostNetwork: true
+
+hubble:
+  enabled: true
+  relay:
+    enabled: __HUBBLE_RELAY__
+  ui:
+    enabled: false
+
+# No arch nodeSelector on purpose: the Cilium images are multi-arch, and
+# pinning the agent DaemonSet to arm64 would silently leave any future amd64
+# node with no CNI at all.

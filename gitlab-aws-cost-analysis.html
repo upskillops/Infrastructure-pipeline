@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GitLab on EKS — AWS resource &amp; cost analysis</title>
+<style>
+  .viz-root {
+    color-scheme: light;
+    --surface-1:#fcfcfb; --surface-2:#f2f2ef; --card:#ffffff;
+    --text-primary:#0b0b0b; --text-secondary:#52514e; --text-muted:#78766f;
+    --rule:#dedcd5; --rule-strong:#b4b1a8; --grid:#e8e6df;
+    --series-1:#2a78d6; --series-2:#eb6834; --series-3:#1baf7a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) .viz-root {
+      color-scheme: dark;
+      --surface-1:#1a1a19; --surface-2:#232320; --card:#2a2a27;
+      --text-primary:#ffffff; --text-secondary:#c3c2b7; --text-muted:#9b998f;
+      --rule:#3d3c37; --rule-strong:#5f5d55; --grid:#333330;
+      --series-1:#3987e5; --series-2:#d95926; --series-3:#199e70;
+    }
+  }
+  :root[data-theme="dark"] .viz-root {
+    color-scheme: dark;
+    --surface-1:#1a1a19; --surface-2:#232320; --card:#2a2a27;
+    --text-primary:#ffffff; --text-secondary:#c3c2b7; --text-muted:#9b998f;
+    --rule:#3d3c37; --rule-strong:#5f5d55; --grid:#333330;
+    --series-1:#3987e5; --series-2:#d95926; --series-3:#199e70;
+  }
+  * { box-sizing:border-box; }
+  /* --surface-1 is scoped to .viz-root, so body cannot read it -- let the
+     root element fill the viewport instead of colouring body. */
+  body { margin:0; }
+  .viz-root { min-height:100vh; background:var(--surface-1); color:var(--text-primary);
+    font:15px/1.55 ui-sans-serif,-apple-system,"Segoe UI",Roboto,sans-serif;
+    padding:40px 28px 72px; }
+  .wrap { max-width:1140px; margin:0 auto; }
+  h1 { font-size:27px; margin:0 0 6px; letter-spacing:-.02em; }
+  h2 { font-size:18px; margin:44px 0 6px; letter-spacing:-.01em; }
+  .sub { color:var(--text-secondary); margin:0 0 6px; }
+  .cap { color:var(--text-muted); font-size:13px; margin:0 0 18px; }
+  .tiles { display:flex; gap:14px; flex-wrap:wrap; margin:26px 0 8px; }
+  .tile { flex:1 1 210px; background:var(--card); border:1px solid var(--rule);
+    border-radius:10px; padding:16px 18px; }
+  .tile .k { font-size:12.5px; color:var(--text-secondary); text-transform:uppercase;
+    letter-spacing:.06em; margin-bottom:7px; }
+  .tile .v { font-size:29px; font-weight:640; letter-spacing:-.02em;
+    font-variant-numeric:tabular-nums; }
+  .tile .n { font-size:12.5px; color:var(--text-muted); margin-top:5px; }
+  .panel { background:var(--card); border:1px solid var(--rule); border-radius:12px;
+    padding:20px; margin-top:14px; }
+  .legend { display:flex; gap:20px; flex-wrap:wrap; margin:0 0 16px;
+    font-size:13.5px; color:var(--text-secondary); }
+  .sw { width:11px; height:11px; border-radius:3px; display:inline-block;
+    margin-right:7px; vertical-align:-1px; }
+  table { width:100%; border-collapse:collapse; font-size:14px; }
+  th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--rule); vertical-align:top; }
+  th { font-size:12.5px; text-transform:uppercase; letter-spacing:.05em; color:var(--text-secondary); }
+  .gh th { background:var(--surface-2); font-size:14px; text-transform:none;
+    letter-spacing:0; color:var(--text-primary); }
+  .gh .gs { font-weight:400; color:var(--text-muted); font-size:12.5px; margin-left:10px; }
+  .gh td { background:var(--surface-2); }
+  .num { text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
+  .neg { color:var(--series-3); }
+  .dim { color:var(--text-secondary); }
+  .note { font-size:13px; color:var(--text-muted); }
+  tfoot td { font-weight:650; border-top:2px solid var(--rule-strong); border-bottom:none; }
+  text { font-family:ui-sans-serif,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  .sec { font-size:13px; font-weight:620; fill:var(--text-primary); }
+  .bx-t { font-size:13px; font-weight:600; fill:var(--text-primary); }
+  .bx-s { font-size:11.5px; fill:var(--text-secondary); }
+  .bx-c { font-size:12px; font-weight:620; fill:var(--text-primary);
+    font-variant-numeric:tabular-nums; }
+  .bx-e { font-size:11.5px; font-weight:600; fill:var(--series-1); }
+  .lbl { font-size:12.5px; fill:var(--text-secondary); }
+  .val { font-size:12.5px; font-weight:620; fill:var(--text-primary);
+    font-variant-numeric:tabular-nums; }
+  .ax  { font-size:11.5px; fill:var(--text-muted); }
+  .bar { cursor:default; outline:none; }
+  .bar:hover rect:not([fill=transparent]), .bar:focus-visible rect:not([fill=transparent]) { opacity:.82; }
+  .bar:focus-visible .lbl, .bar:hover .lbl { fill:var(--text-primary); }
+  #tip { position:fixed; z-index:9; max-width:330px; background:var(--card);
+    color:var(--text-primary); border:1px solid var(--rule-strong); border-radius:8px;
+    padding:9px 11px; font-size:12.5px; line-height:1.45; pointer-events:none;
+    opacity:0; transition:opacity .1s; box-shadow:0 4px 16px rgb(0 0 0 / .13); }
+  .warn { border-left:3px solid var(--series-2); padding-left:14px; margin:16px 0;
+    color:var(--text-secondary); font-size:14px; }
+</style></head>
+<body><div class="viz-root"><div class="wrap">
+
+<h1>GitLab on EKS — AWS resources and cost</h1>
+<p class="sub">Everything <code>terraform-karpenter-nodepools</code> provisions at its default variable values, priced at on-demand rates.</p>
+<p class="cap">us-east-1 · 730 hours/month · rates pulled from the AWS Pricing API on 2026-09-19 · generated by <code>cost/build.py</code></p>
+
+<div class="tiles">
+  <div class="tile"><div class="k">Total / month</div><div class="v">$1,716.29</div><div class="n">$20,595.47 per year</div></div>
+  <div class="tile"><div class="k">GitLab only</div><div class="v">$687.51</div><div class="n">40% of the bill · disappears if enable_gitlab = false</div></div>
+  <div class="tile"><div class="k">GitLab + shared cluster</div><div class="v">$1,002.95</div><div class="n">what a GitLab-only cluster would cost</div></div>
+  <div class="tile"><div class="k">After the savings levers</div><div class="v">$1,180.48</div><div class="n">−$535.81/mo · see below</div></div>
+</div>
+
+<h2>What gets created</h2>
+<p class="cap">Blue = billed to GitLab · orange = shared cluster · green = other workload tiers. Costs shown are monthly.</p>
+<div class="panel"><svg viewBox="0 0 1080 862" width="100%" role="img" aria-label="AWS resources used by GitLab on EKS, with monthly cost per resource"><defs><marker id="ar" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="var(--rule-strong)"/></marker></defs><rect x="350.0" y="16" width="380" height="40" rx="8" fill="var(--surface-2)" stroke="var(--rule)" stroke-width="1.5"/><text x="540.0" y="41" class="bx-t" text-anchor="middle">Internet — browsers, git clients, CI runners</text><line x1="540.0" y1="56" x2="540.0" y2="77" stroke="var(--rule-strong)" stroke-width="2" marker-end="url(#ar)"/><rect x="350.0" y="84" width="380" height="69" rx="8" fill="var(--card)" stroke="var(--rule)" stroke-width="1.5"/><text x="364.0" y="106" class="bx-t">Route 53</text><text x="364.0" y="124" class="bx-s">public hosted zone · gitlab.&lt;domain&gt;</text><text x="364.0" y="139" class="bx-s">records written by external-dns</text><text x="718.0" y="106" class="bx-c" text-anchor="end">$0.50</text><line x1="540.0" y1="153" x2="540.0" y2="174" stroke="var(--rule-strong)" stroke-width="2" marker-end="url(#ar)"/><rect x="350.0" y="181" width="380" height="69" rx="8" fill="var(--card)" stroke="var(--rule)" stroke-width="1.5"/><text x="364.0" y="203" class="bx-t">Network Load Balancer</text><text x="364.0" y="221" class="bx-s">internet-facing, ip targets</text><text x="364.0" y="236" class="bx-s">created by AWS LBC from Envoy Gateway</text><text x="718.0" y="203" class="bx-c" text-anchor="end">$38.33</text><line x1="540.0" y1="250" x2="540.0" y2="273" stroke="var(--rule-strong)" stroke-width="2" marker-end="url(#ar)"/><rect x="24" y="280" width="1032" height="482" rx="12" fill="var(--surface-2)" stroke="var(--rule)" stroke-width="1.5" stroke-dasharray="6 4"/><text x="44" y="306" class="sec">VPC 10.0.0.0/16 · 3 availability zones</text><rect x="48" y="320" width="984" height="66" rx="8" fill="var(--card)" stroke="var(--rule)" stroke-width="1"/><text x="64" y="340" class="bx-s">Public subnets ×3</text><rect x="64.0" y="348" width="308.0" height="28" rx="6" fill="var(--surface-2)" stroke="var(--rule)"/><text x="74.0" y="367" class="bx-s">NAT Gateway · AZ a</text><rect x="386.0" y="348" width="308.0" height="28" rx="6" fill="var(--surface-2)" stroke="var(--rule)"/><text x="396.0" y="367" class="bx-s">NAT Gateway · AZ b</text><rect x="708.0" y="348" width="308.0" height="28" rx="6" fill="var(--surface-2)" stroke="var(--rule)"/><text x="718.0" y="367" class="bx-s">NAT Gateway · AZ c</text><text x="1016" y="340" class="bx-c" text-anchor="end">$105.30</text><rect x="48" y="406" width="984" height="214" rx="10" fill="var(--card)" stroke="var(--rule-strong)" stroke-width="1.5"/><text x="64" y="430" class="sec">EKS cluster · private subnets ×3 · Cilium CNI (no VPC CNI, no kube-proxy)</text><text x="1016" y="430" class="bx-c" text-anchor="end">control plane $73.00</text><rect x="64.0" y="442" width="227.5" height="158" rx="8" fill="var(--surface-2)" stroke="var(--rule)" stroke-width="1.5"/><rect x="64.0" y="442" width="4" height="158" rx="2" fill="var(--series-2)"/><text x="78.0" y="464" class="bx-t"></text><text x="80.0" y="464" class="bx-t">core · 2 × m7g.large</text><text x="80.0" y="484" class="bx-s">Cilium operator, CoreDNS</text><text x="80.0" y="499" class="bx-s">Karpenter, AWS LBC, external-dns</text><text x="80.0" y="588" class="bx-c">$127.14/mo</text><rect x="305.5" y="442" width="227.5" height="158" rx="8" fill="var(--surface-2)" stroke="var(--rule)" stroke-width="1.5"/><rect x="305.5" y="442" width="4" height="158" rx="2" fill="var(--series-1)"/><text x="319.5" y="464" class="bx-t"></text><text x="321.5" y="464" class="bx-t">infra · 3 × m7g.xlarge</text><text x="321.5" y="484" class="bx-s">webservice, sidekiq, gitaly</text><text x="321.5" y="499" class="bx-s">registry, kas, runner manager</text><text x="321.5" y="514" class="bx-s">cert-manager, Envoy Gateway</text><text x="321.5" y="588" class="bx-c">$376.61/mo</text><rect x="547.0" y="442" width="227.5" height="158" rx="8" fill="var(--surface-2)" stroke="var(--rule)" stroke-width="1.5"/><rect x="547.0" y="442" width="4" height="158" rx="2" fill="var(--series-3)"/><text x="561.0" y="464" class="bx-t"></text><text x="563.0" y="464" class="bx-t">app · 3 × m7g.xlarge</text><text x="563.0" y="484" class="bx-s">application workloads</text><text x="563.0" y="499" class="bx-s">taint workload=app</text><text x="563.0" y="588" class="bx-c">$376.61/mo</text><rect x="788.5" y="442" width="227.5" height="158" rx="8" fill="var(--surface-2)" stroke="var(--rule)" stroke-width="1.5"/><rect x="788.5" y="442" width="4" height="158" rx="2" fill="var(--series-3)"/><text x="802.5" y="464" class="bx-t"></text><text x="804.5" y="464" class="bx-t">monitoring · 2 × r7g.xlarge</text><text x="804.5" y="484" class="bx-s">Prometheus, Loki</text><text x="804.5" y="499" class="bx-s">taint workload=monitoring</text><text x="804.5" y="588" class="bx-c">$336.73/mo</text><text x="321.5" y="556" class="bx-e">◄ GitLab pinned here</text><text x="64" y="654" class="sec">Managed data services · private subnets</text><rect x="64.0" y="666" width="308.0" height="76" rx="8" fill="var(--card)" stroke="var(--rule)" stroke-width="1.5"/><rect x="64.0" y="666" width="4" height="76" rx="2" fill="var(--series-1)"/><text x="78.0" y="688" class="bx-t"></text><text x="80.0" y="688" class="bx-t">RDS PostgreSQL 17</text><text x="80.0" y="708" class="bx-s">db.m7g.large · Single-AZ</text><text x="80.0" y="723" class="bx-s">100 GiB gp3 · 7-day backups</text><text x="360.0" y="688" class="bx-c" text-anchor="end">$134.14</text><rect x="386.0" y="666" width="308.0" height="76" rx="8" fill="var(--card)" stroke="var(--rule)" stroke-width="1.5"/><rect x="386.0" y="666" width="4" height="76" rx="2" fill="var(--series-1)"/><text x="400.0" y="688" class="bx-t"></text><text x="402.0" y="688" class="bx-t">ElastiCache Redis 7.1</text><text x="402.0" y="708" class="bx-s">cache.m7g.large · 1 node</text><text x="402.0" y="723" class="bx-s">TLS + AUTH, no failover</text><text x="682.0" y="688" class="bx-c" text-anchor="end">$115.34</text><rect x="708.0" y="666" width="308.0" height="76" rx="8" fill="var(--card)" stroke="var(--rule)" stroke-width="1.5"/><rect x="708.0" y="666" width="4" height="76" rx="2" fill="var(--series-1)"/><text x="722.0" y="688" class="bx-t"></text><text x="724.0" y="688" class="bx-t">EBS · Gitaly volume</text><text x="724.0" y="708" class="bx-s">100 GiB gp3-infra</text><text x="724.0" y="723" class="bx-s">4000 IOPS · 250 MB/s · Retain</text><text x="1004.0" y="688" class="bx-c" text-anchor="end">$18.00</text><rect x="24" y="784" width="1032" height="62" rx="10" fill="var(--card)" stroke="var(--rule)" stroke-width="1.5"/><text x="44" y="808" class="sec">Regional services — outside the VPC, reached via NAT</text><text x="44" y="830" class="bx-s">S3 ×12 buckets — artifacts · LFS · uploads · packages · registry · backups · CI secure files · MR diffs · TF state · pages · tmp · dependency proxy</text><text x="1036" y="808" class="bx-c" text-anchor="end">$4.60</text></svg></div>
+
+<h2>Cost by resource</h2>
+<div class="legend">
+  <span><span class="sw" style="background:var(--series-1)"></span>GitLab</span>
+  <span><span class="sw" style="background:var(--series-2)"></span>Shared cluster</span>
+  <span><span class="sw" style="background:var(--series-3)"></span>app + monitoring tiers</span>
+</div>
+<div class="panel"><svg viewBox="0 0 1000 666" width="100%" role="img" aria-label="Monthly cost by resource, ranked"><text x="0" y="14" class="ax">monthly cost, USD</text><line x1="300.0" y1="24" x2="300.0" y2="644" stroke="var(--grid)" stroke-width="1"/><text x="300.0" y="658" class="ax" text-anchor="middle">$0</text><line x1="467.9" y1="24" x2="467.9" y2="644" stroke="var(--grid)" stroke-width="1"/><text x="467.9" y="658" class="ax" text-anchor="middle">$100</text><line x1="635.8" y1="24" x2="635.8" y2="644" stroke="var(--grid)" stroke-width="1"/><text x="635.8" y="658" class="ax" text-anchor="middle">$200</text><line x1="803.6" y1="24" x2="803.6" y2="644" stroke="var(--grid)" stroke-width="1"/><text x="803.6" y="658" class="ax" text-anchor="middle">$300</text><line x1="971.5" y1="24" x2="971.5" y2="644" stroke="var(--grid)" stroke-width="1"/><text x="971.5" y="658" class="ax" text-anchor="middle">$400</text><g class="bar" tabindex="0" data-tip="infra node group — 3 x m7g.xlarge on-demand — $357.41/mo · GitLab is pinned here. On-demand not spot on purpose: Gitaly is stateful."><rect x="0" y="26" width="990" height="30" fill="transparent"/><text x="288" y="45" class="lbl" text-anchor="end">infra node group</text><rect x="300" y="30" width="600.0" height="22" rx="4" fill="var(--series-1)"/><text x="909.0" y="45" class="val">$357.41</text></g><g class="bar" tabindex="0" data-tip="app node group — 3 x m7g.xlarge on-demand — $357.41/mo"><rect x="0" y="57" width="990" height="30" fill="transparent"/><text x="288" y="76" class="lbl" text-anchor="end">app node group</text><rect x="300" y="61" width="600.0" height="22" rx="4" fill="var(--series-3)"/><text x="909.0" y="76" class="val">$357.41</text></g><g class="bar" tabindex="0" data-tip="monitoring node group — 2 x r7g.xlarge on-demand — $312.73/mo · Memory-biased for Prometheus and Loki."><rect x="0" y="88" width="990" height="30" fill="transparent"/><text x="288" y="107" class="lbl" text-anchor="end">monitoring node group</text><rect x="300" y="92" width="525.0" height="22" rx="4" fill="var(--series-3)"/><text x="834.0" y="107" class="val">$312.73</text></g><g class="bar" tabindex="0" data-tip="RDS PostgreSQL 17 — db.m7g.large, Single-AZ — $122.64/mo · Multi-AZ roughly doubles this. Chart v10 removed bundled Postgres, so this is mandatory."><rect x="0" y="119" width="990" height="30" fill="transparent"/><text x="288" y="138" class="lbl" text-anchor="end">RDS PostgreSQL 17</text><rect x="300" y="123" width="205.9" height="22" rx="4" fill="var(--series-1)"/><text x="514.9" y="138" class="val">$122.64</text></g><g class="bar" tabindex="0" data-tip="core node group — 2 x m7g.large on-demand — $119.14/mo · Untainted tier: Cilium operator, CoreDNS, Karpenter, LBC, external-dns."><rect x="0" y="150" width="990" height="30" fill="transparent"/><text x="288" y="169" class="lbl" text-anchor="end">core node group</text><rect x="300" y="154" width="200.0" height="22" rx="4" fill="var(--series-2)"/><text x="509.0" y="169" class="val">$119.14</text></g><g class="bar" tabindex="0" data-tip="ElastiCache Redis — cache.m7g.large, 1 node — $115.34/mo · Single node, no failover. Chart v10 removed bundled Redis too."><rect x="0" y="181" width="990" height="30" fill="transparent"/><text x="288" y="200" class="lbl" text-anchor="end">ElastiCache Redis</text><rect x="300" y="185" width="193.6" height="22" rx="4" fill="var(--series-1)"/><text x="502.6" y="200" class="val">$115.34</text></g><g class="bar" tabindex="0" data-tip="NAT Gateways — 3, one per AZ — $98.55/mo · single_nat_gateway = false. Dropping to 1 saves two thirds, at the cost of AZ isolation."><rect x="0" y="212" width="990" height="30" fill="transparent"/><text x="288" y="231" class="lbl" text-anchor="end">NAT Gateways</text><rect x="300" y="216" width="165.4" height="22" rx="4" fill="var(--series-2)"/><text x="474.4" y="231" class="val">$98.55</text></g><g class="bar" tabindex="0" data-tip="EKS control plane — 1 cluster — $73.00/mo · Flat. Would be $0.60/hr on a version in extended support; 1.35 is not."><rect x="0" y="243" width="990" height="30" fill="transparent"/><text x="288" y="262" class="lbl" text-anchor="end">EKS control plane</text><rect x="300" y="247" width="122.5" height="22" rx="4" fill="var(--series-2)"/><text x="431.5" y="262" class="val">$73.00</text></g><g class="bar" tabindex="0" data-tip="monitoring root volumes — 2 x 150 GiB gp3 — $24.00/mo"><rect x="0" y="274" width="990" height="30" fill="transparent"/><text x="288" y="293" class="lbl" text-anchor="end">monitoring root volumes</text><rect x="300" y="278" width="40.3" height="22" rx="4" fill="var(--series-3)"/><text x="349.3" y="293" class="val">$24.00</text></g><g class="bar" tabindex="0" data-tip="NLB capacity units — ~5 LCU average — $21.90/mo · Estimate. Scales with concurrent connections and bandwidth - git clones are bursty."><rect x="0" y="305" width="990" height="30" fill="transparent"/><text x="288" y="324" class="lbl" text-anchor="end">NLB capacity units</text><rect x="300" y="309" width="36.8" height="22" rx="4" fill="var(--series-1)"/><text x="345.8" y="324" class="val">$21.90</text></g><g class="bar" tabindex="0" data-tip="infra root volumes — 3 x 80 GiB gp3 — $19.20/mo"><rect x="0" y="336" width="990" height="30" fill="transparent"/><text x="288" y="355" class="lbl" text-anchor="end">infra root volumes</text><rect x="300" y="340" width="32.2" height="22" rx="4" fill="var(--series-1)"/><text x="341.2" y="355" class="val">$19.20</text></g><g class="bar" tabindex="0" data-tip="app root volumes — 3 x 80 GiB gp3 — $19.20/mo"><rect x="0" y="367" width="990" height="30" fill="transparent"/><text x="288" y="386" class="lbl" text-anchor="end">app root volumes</text><rect x="300" y="371" width="32.2" height="22" rx="4" fill="var(--series-3)"/><text x="341.2" y="386" class="val">$19.20</text></g><g class="bar" tabindex="0" data-tip="Gitaly volume — 100 GiB gp3-infra, 4000 IOPS, 250 MB/s — $18.00/mo · $8 storage + $5 IOPS + $5 throughput. The provisioned headroom is the $10."><rect x="0" y="398" width="990" height="30" fill="transparent"/><text x="288" y="417" class="lbl" text-anchor="end">Gitaly volume</text><rect x="300" y="402" width="30.2" height="22" rx="4" fill="var(--series-1)"/><text x="339.2" y="417" class="val">$18.00</text></g><g class="bar" tabindex="0" data-tip="Network Load Balancer — 1 internet-facing — $16.43/mo · Created by the AWS LBC from the Envoy Gateway Service."><rect x="0" y="429" width="990" height="30" fill="transparent"/><text x="288" y="448" class="lbl" text-anchor="end">Network Load Balancer</text><rect x="300" y="433" width="27.6" height="22" rx="4" fill="var(--series-1)"/><text x="336.6" y="448" class="val">$16.43</text></g><g class="bar" tabindex="0" data-tip="RDS storage — 100 GiB gp3, autoscale to 400 — $11.50/mo · 7-day backups are free up to allocated size."><rect x="0" y="460" width="990" height="30" fill="transparent"/><text x="288" y="479" class="lbl" text-anchor="end">RDS storage</text><rect x="300" y="464" width="19.3" height="22" rx="4" fill="var(--series-1)"/><text x="328.3" y="479" class="val">$11.50</text></g><g class="bar" tabindex="0" data-tip="CloudWatch control-plane logs — api + audit + authenticator, ~20 GB/mo — $10.00/mo · audit is by far the largest of the three. Drop it from cluster_enabled_log_types to cut this."><rect x="0" y="491" width="990" height="30" fill="transparent"/><text x="288" y="510" class="lbl" text-anchor="end">CloudWatch control-plane logs</text><rect x="300" y="495" width="16.8" height="22" rx="4" fill="var(--series-2)"/><text x="325.8" y="510" class="val">$10.00</text></g><g class="bar" tabindex="0" data-tip="core root volumes — 2 x 50 GiB gp3 — $8.00/mo"><rect x="0" y="522" width="990" height="30" fill="transparent"/><text x="288" y="541" class="lbl" text-anchor="end">core root volumes</text><rect x="300" y="526" width="13.4" height="22" rx="4" fill="var(--series-2)"/><text x="322.4" y="541" class="val">$8.00</text></g><g class="bar" tabindex="0" data-tip="NAT data processing — ~150 GB/mo egress — $6.75/mo · Estimate. Image pulls dominate; scales with how often nodes cycle."><rect x="0" y="553" width="990" height="30" fill="transparent"/><text x="288" y="572" class="lbl" text-anchor="end">NAT data processing</text><rect x="300" y="557" width="11.3" height="22" rx="4" fill="var(--series-2)"/><text x="320.3" y="572" class="val">$6.75</text></g><g class="bar" tabindex="0" data-tip="S3 object storage — 12 buckets, ~200 GB total — $4.60/mo · Artifacts, LFS, uploads, packages, registry, backups. Grows with CI retention."><rect x="0" y="584" width="990" height="30" fill="transparent"/><text x="288" y="603" class="lbl" text-anchor="end">S3 object storage</text><rect x="300" y="588" width="7.7" height="22" rx="4" fill="var(--series-1)"/><text x="316.7" y="603" class="val">$4.60</text></g><g class="bar" tabindex="0" data-tip="Route53 hosted zone — 1 public zone — $0.50/mo"><rect x="0" y="615" width="990" height="30" fill="transparent"/><text x="288" y="634" class="lbl" text-anchor="end">Route53 hosted zone</text><rect x="300" y="619" width="3.0" height="22" rx="4" fill="var(--series-1)"/><text x="312.0" y="634" class="val">$0.50</text></g></svg></div>
+
+<div class="warn"><strong>Compute is 67% of the bill.</strong>
+Ten on-demand nodes cost $1,146.68/month. Every other line item put together is
+$569.61. Optimise node count and commitment before anything else.</div>
+
+<h2>Itemised</h2>
+<table>
+  <thead><tr><th>Resource</th><th>Quantity</th><th>Note</th><th class="num">$/month</th></tr></thead>
+  <tbody><tr class="gh"><th colspan="3"><span class="sw" style="background:var(--series-1)"></span>GitLab<span class="gs">Provisioned only when enable_gitlab = true</span></th><td class="num">$687.51</td></tr><tr><td>infra node group</td><td class="dim">3 x m7g.xlarge on-demand</td><td class="dim note">GitLab is pinned here. On-demand not spot on purpose: Gitaly is stateful.</td><td class="num">$357.41</td></tr><tr><td>infra root volumes</td><td class="dim">3 x 80 GiB gp3</td><td class="dim note"></td><td class="num">$19.20</td></tr><tr><td>RDS PostgreSQL 17</td><td class="dim">db.m7g.large, Single-AZ</td><td class="dim note">Multi-AZ roughly doubles this. Chart v10 removed bundled Postgres, so this is mandatory.</td><td class="num">$122.64</td></tr><tr><td>RDS storage</td><td class="dim">100 GiB gp3, autoscale to 400</td><td class="dim note">7-day backups are free up to allocated size.</td><td class="num">$11.50</td></tr><tr><td>ElastiCache Redis</td><td class="dim">cache.m7g.large, 1 node</td><td class="dim note">Single node, no failover. Chart v10 removed bundled Redis too.</td><td class="num">$115.34</td></tr><tr><td>Gitaly volume</td><td class="dim">100 GiB gp3-infra, 4000 IOPS, 250 MB/s</td><td class="dim note">$8 storage + $5 IOPS + $5 throughput. The provisioned headroom is the $10.</td><td class="num">$18.00</td></tr><tr><td>Network Load Balancer</td><td class="dim">1 internet-facing</td><td class="dim note">Created by the AWS LBC from the Envoy Gateway Service.</td><td class="num">$16.43</td></tr><tr><td>NLB capacity units</td><td class="dim">~5 LCU average</td><td class="dim note">Estimate. Scales with concurrent connections and bandwidth - git clones are bursty.</td><td class="num">$21.90</td></tr><tr><td>S3 object storage</td><td class="dim">12 buckets, ~200 GB total</td><td class="dim note">Artifacts, LFS, uploads, packages, registry, backups. Grows with CI retention.</td><td class="num">$4.60</td></tr><tr><td>Route53 hosted zone</td><td class="dim">1 public zone</td><td class="dim note"></td><td class="num">$0.50</td></tr><tr class="gh"><th colspan="3"><span class="sw" style="background:var(--series-2)"></span>Shared cluster<span class="gs">Needed whether or not GitLab is installed</span></th><td class="num">$315.44</td></tr><tr><td>EKS control plane</td><td class="dim">1 cluster</td><td class="dim note">Flat. Would be $0.60/hr on a version in extended support; 1.35 is not.</td><td class="num">$73.00</td></tr><tr><td>core node group</td><td class="dim">2 x m7g.large on-demand</td><td class="dim note">Untainted tier: Cilium operator, CoreDNS, Karpenter, LBC, external-dns.</td><td class="num">$119.14</td></tr><tr><td>core root volumes</td><td class="dim">2 x 50 GiB gp3</td><td class="dim note"></td><td class="num">$8.00</td></tr><tr><td>NAT Gateways</td><td class="dim">3, one per AZ</td><td class="dim note">single_nat_gateway = false. Dropping to 1 saves two thirds, at the cost of AZ isolation.</td><td class="num">$98.55</td></tr><tr><td>NAT data processing</td><td class="dim">~150 GB/mo egress</td><td class="dim note">Estimate. Image pulls dominate; scales with how often nodes cycle.</td><td class="num">$6.75</td></tr><tr><td>CloudWatch control-plane logs</td><td class="dim">api + audit + authenticator, ~20 GB/mo</td><td class="dim note">audit is by far the largest of the three. Drop it from cluster_enabled_log_types to cut this.</td><td class="num">$10.00</td></tr><tr class="gh"><th colspan="3"><span class="sw" style="background:var(--series-3)"></span>app + monitoring tiers<span class="gs">Capacity floors for everything else</span></th><td class="num">$713.34</td></tr><tr><td>app node group</td><td class="dim">3 x m7g.xlarge on-demand</td><td class="dim note"></td><td class="num">$357.41</td></tr><tr><td>app root volumes</td><td class="dim">3 x 80 GiB gp3</td><td class="dim note"></td><td class="num">$19.20</td></tr><tr><td>monitoring node group</td><td class="dim">2 x r7g.xlarge on-demand</td><td class="dim note">Memory-biased for Prometheus and Loki.</td><td class="num">$312.73</td></tr><tr><td>monitoring root volumes</td><td class="dim">2 x 150 GiB gp3</td><td class="dim note"></td><td class="num">$24.00</td></tr></tbody>
+  <tfoot><tr><td colspan="3">Total</td><td class="num">$1,716.29</td></tr></tfoot>
+</table>
+
+<h2>Savings levers</h2>
+<table>
+  <thead><tr><th>Change</th><th>Trade-off</th><th class="num">$/month</th></tr></thead>
+  <tbody><tr><td>1-year Compute Savings Plan on all 10 nodes</td><td class="dim note">No architectural change. Largest single lever by a wide margin.</td><td class="num neg">−$387.92</td></tr><tr><td>single_nat_gateway = true</td><td class="dim note">Loses per-AZ isolation: one AZ&#x27;s NAT failure takes egress down cluster-wide.</td><td class="num neg">−$65.70</td></tr><tr><td>1-year RI on RDS + ElastiCache</td><td class="dim note">Same caveat as the Savings Plan: a 1-year commitment.</td><td class="num neg">−$65.19</td></tr><tr><td>Drop the audit control-plane log type</td><td class="dim note">Only if you have no compliance requirement for it.</td><td class="num neg">−$7.00</td></tr><tr><td>Gitaly at gp3 baseline IOPS/throughput</td><td class="dim note">Measure first. If Gitaly is not IO-bound the provisioned headroom is wasted.</td><td class="num neg">−$10.00</td></tr></tbody>
+  <tfoot><tr><td colspan="2">Combined → $1,180.48/month</td><td class="num neg">−$535.81</td></tr></tfoot>
+</table>
+
+<h2>What is not in these numbers</h2>
+<table>
+  <tbody>
+  <tr><td>Karpenter burst capacity</td><td class="dim">Usage-driven and unbounded by design. NodePool ceilings are 160 vCPU infra, 480 app, 128 monitoring — a fully saturated infra pool would add roughly $4,765.44/mo on-demand, or about 43% less on spot.</td></tr>
+  <tr><td>Inter-AZ data transfer</td><td class="dim">$0.01/GB each way. Cilium ENI mode gives pods real VPC IPs, so cross-AZ pod traffic is billed normally.</td></tr>
+  <tr><td>Internet egress</td><td class="dim">Git clones and container pulls leaving the NLB. Highly workload-dependent.</td></tr>
+  <tr><td>RDS / ElastiCache snapshots beyond the free allocation</td><td class="dim">7-day RDS backups are free up to allocated storage; 3 Redis snapshots are small.</td></tr>
+  <tr><td>gp3-monitoring PVCs</td><td class="dim">The StorageClass exists but no PVC uses it yet. Prometheus + Loki at, say, 500 GiB with 6000 IOPS and 500 MB/s would add about $70.00/mo.</td></tr>
+  <tr><td>EKS extended support</td><td class="dim">$0.60/hr instead of $0.10 once 1.35 leaves standard support on 2027-03-27 — that is a $365.00/mo cliff if you do not upgrade.</td></tr>
+  </tbody>
+</table>
+
+</div></div>
+<div id="tip" role="status"></div>
+<script>
+  const tip = document.getElementById('tip');
+  const show = (ev, el) => {
+    tip.textContent = el.dataset.tip;
+    tip.style.opacity = 1;
+    const r = tip.getBoundingClientRect();
+    const x = (ev.clientX ?? el.getBoundingClientRect().right) + 14;
+    const y = (ev.clientY ?? el.getBoundingClientRect().top) + 14;
+    tip.style.left = Math.min(x, innerWidth  - r.width  - 12) + 'px';
+    tip.style.top  = Math.min(y, innerHeight - r.height - 12) + 'px';
+  };
+  for (const el of document.querySelectorAll('.bar')) {
+    el.addEventListener('mousemove', ev => show(ev, el));
+    el.addEventListener('focus',     ev => show(ev, el));
+    el.addEventListener('mouseleave', () => tip.style.opacity = 0);
+    el.addEventListener('blur',       () => tip.style.opacity = 0);
+  }
+</script>
+</body></html>
