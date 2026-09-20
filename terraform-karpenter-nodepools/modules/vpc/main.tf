@@ -1,6 +1,10 @@
-data "aws_availability_zones" "available" {
-  count = var.create_cluster ? 1 : 0
+###############################################################################
+# VPC. A thin wrapper over terraform-aws-modules/vpc, here only so the root
+# stays pure composition -- the two things it adds are AZ selection and the
+# subnet tags Kubernetes and Karpenter discover subnets by.
+###############################################################################
 
+data "aws_availability_zones" "available" {
   state = "available"
 
   # Exclude local/wavelength zones, which cannot host EKS nodes.
@@ -11,16 +15,15 @@ data "aws_availability_zones" "available" {
 }
 
 locals {
-  azs = var.create_cluster ? slice(data.aws_availability_zones.available[0].names, 0, var.az_count) : []
+  azs = slice(data.aws_availability_zones.available.names, 0, var.az_count)
 }
 
-module "vpc" {
-  count   = var.create_cluster ? 1 : 0
+module "this" {
   source  = "terraform-aws-modules/vpc/aws"
   version = "~> 6.7"
 
   name = "${var.cluster_name}-vpc"
-  cidr = var.vpc_cidr
+  cidr = var.cidr
 
   azs             = local.azs
   public_subnets  = var.public_subnet_cidrs

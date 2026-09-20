@@ -3,19 +3,19 @@
 #
 # Provides burst capacity above the managed node group floors. The v21
 # submodule wires the controller up with EKS Pod Identity instead of IRSA,
-# which is why aws_eks_addon.pod_identity has to exist first.
+# which is why the caller must order this module after the Pod Identity agent
+# addon in modules/cluster-addons.
 ###############################################################################
 
-module "karpenter" {
-  count   = var.create_cluster ? 1 : 0
+module "this" {
   source  = "terraform-aws-modules/eks/aws//modules/karpenter"
   version = "~> 21.25"
 
-  cluster_name = module.eks[0].cluster_name
+  cluster_name = var.cluster_name
 
   # Node role for Karpenter-launched instances. Kept separate from the managed
-  # node group role in nodegroups.tf because the submodule also registers this
-  # one with the cluster via its own EKS access entry.
+  # node group role because the submodule also registers this one with the
+  # cluster via its own EKS access entry.
   create_node_iam_role          = true
   node_iam_role_name            = "${var.cluster_name}-karpenter-node"
   node_iam_role_use_name_prefix = false
@@ -44,15 +44,13 @@ module "karpenter" {
 }
 
 resource "helm_release" "karpenter" {
-  count = var.create_cluster ? 1 : 0
-
   name             = "karpenter"
   namespace        = "kube-system"
   create_namespace = false
 
   repository = "oci://public.ecr.aws/karpenter"
   chart      = "karpenter"
-  version    = var.karpenter_version
+  version    = var.chart_version
 
   wait    = true
   timeout = 600
@@ -60,31 +58,15 @@ resource "helm_release" "karpenter" {
   values = [
     yamlencode({
       settings = {
-        clusterName       = module.eks[0].cluster_name
-        clusterEndpoint   = module.eks[0].cluster_endpoint
-        interruptionQueue = module.karpenter[0].queue_name
+        clusterName       = var.cluster_name
+        clusterEndpoint   = var.cluster_endpoint
+        interruptionQueue = module.this.queue_name
       }
 
-      # Pin the controller to the untainted core group. Karpenter cannot manage
-      # the nodes it runs on, so it must never land on a pool it owns.
-      nodeSelector = {
-        node-role = "core"
-      }
-
-      # The chart applies a *required* podAntiAffinity on kubernetes.io/hostname,
-      # so these replicas need that many distinct core nodes. Because this
-      # release uses wait = true, workload_node_groups["core"].desired_size must
-      # stay >= karpenter_replicas, or the apply blocks on a Pending pod until
-      # it times out.
-      replicas = var.karpenter_replicas
+      nodeSelector = var.node_selector
+      replicas     = var.replicas
     })
   ]
 
-  # cluster_addons carries both the CoreDNS addon (the controller needs DNS)
-  # and the Pod Identity agent (which is how the v21 submodule authenticates
-  # the controller -- without it Karpenter cannot call EC2 at all).
-  depends_on = [
-    module.karpenter,
-    module.cluster_addons,
-  ]
+  depends_on = [module.this]
 }

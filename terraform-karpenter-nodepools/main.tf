@@ -1,16 +1,19 @@
 ###############################################################################
 # Composition.
 #
-# This file wires the pieces together and does nothing else. Each concern is a
-# module; the ordering between them is the whole point of the design and is
+# This file wires modules together and declares nothing else. Every resource
+# lives in modules/; the root holds only main.tf, variables.tf, outputs.tf,
+# providers.tf, versions.tf and the tfvars.
+#
+# Ordering between the modules is the whole point of the design, so it is
 # stated explicitly with depends_on rather than left to be inferred:
 #
-#   vpc -> eks -> [cilium] -> node groups -> cluster-addons -> ingress -> gitlab
-#                                                     \-> karpenter -> nodepools
+#   vpc -> eks -> [cilium] -> nodegroups -> cluster-addons -> ingress -> gitlab
+#                                                   \-> karpenter -> nodepools
 #
-# The bracket around cilium is deliberate: under the default
+# The brackets around cilium are deliberate: under the default
 # cilium_install_method = "helm" that module creates only an IAM role, and the
-# CNI arrives out of band while the node groups block. See modules/cilium.
+# CNI arrives out of band while nodegroups blocks. See ../helm-charts.
 ###############################################################################
 
 locals {
@@ -18,20 +21,62 @@ locals {
   # absence of the vpc-cni / kube-proxy addons in modules/cluster-addons.
   install_cilium = var.create_cluster && var.install_cilium
 
-  # ...and this decides whether Terraform is also the thing that installs it.
-  # Read by nodegroups.tf to pick a create timeout.
+  # ...and this decides whether Terraform is also the thing that installs it,
+  # which is what sets the node group create timeout below.
   cilium_via_terraform = local.install_cilium && var.cilium_install_method == "terraform"
 
-  # Governs the AWS side of GitLab: RDS, ElastiCache, S3, Route53, IRSA.
-  # True regardless of who installs the chart -- the datastores have to exist
+  # 20m when Terraform installs Cilium: a node that is not Ready by then is a
+  # genuine failure and should surface fast. 45m when Helm does, because the
+  # apply has to sit in the NotReady window long enough for the operator to
+  # run install-cilium.sh.
+  node_group_create_timeout = coalesce(
+    var.node_group_create_timeout,
+    local.cilium_via_terraform ? "20m" : "45m",
+  )
+
+  # Governs the AWS side of GitLab: RDS, ElastiCache, S3, Route53, IRSA. True
+  # regardless of who installs the chart -- the datastores have to exist
   # before either Terraform or `helm install` can point the chart at them.
   gitlab_enabled = var.create_cluster && var.enable_gitlab
-
-  create_addons = var.create_cluster
 }
 
 ###############################################################################
-# CNI
+# Network and control plane
+###############################################################################
+
+module "vpc" {
+  count  = var.create_cluster ? 1 : 0
+  source = "./modules/vpc"
+
+  cluster_name         = var.cluster_name
+  cidr                 = var.vpc_cidr
+  public_subnet_cidrs  = var.public_subnet_cidrs
+  private_subnet_cidrs = var.private_subnet_cidrs
+  az_count             = var.az_count
+  single_nat_gateway   = var.single_nat_gateway
+
+  tags = var.tags
+}
+
+module "eks" {
+  count  = var.create_cluster ? 1 : 0
+  source = "./modules/eks"
+
+  cluster_name       = var.cluster_name
+  kubernetes_version = var.kubernetes_version
+
+  vpc_id     = module.vpc[0].vpc_id
+  subnet_ids = module.vpc[0].private_subnets
+
+  endpoint_public_access       = var.cluster_endpoint_public_access
+  endpoint_public_access_cidrs = var.cluster_endpoint_public_access_cidrs
+  enabled_log_types            = var.cluster_enabled_log_types
+
+  tags = var.tags
+}
+
+###############################################################################
+# CNI -- must exist before any node is created, even when it installs nothing
 ###############################################################################
 
 module "cilium" {
@@ -54,6 +99,38 @@ module "cilium" {
 }
 
 ###############################################################################
+# Compute
+###############################################################################
+
+module "nodegroups" {
+  count  = var.create_cluster ? 1 : 0
+  source = "./modules/nodegroups"
+
+  cluster_name         = module.eks[0].cluster_name
+  kubernetes_version   = module.eks[0].cluster_version
+  cluster_endpoint     = module.eks[0].cluster_endpoint
+  cluster_auth_base64  = module.eks[0].cluster_certificate_authority_data
+  cluster_service_cidr = module.eks[0].cluster_service_cidr
+
+  subnet_ids             = module.vpc[0].private_subnets
+  node_security_group_id = module.eks[0].node_security_group_id
+
+  node_groups    = var.workload_node_groups
+  cilium_is_cni  = var.install_cilium
+  create_timeout = local.node_group_create_timeout
+
+  tags = var.tags
+
+  # The ordering the whole Cilium design turns on. Under
+  # cilium_install_method = "helm" the module's release has count 0, so this
+  # edge only carries the IAM role -- nodes are created with no CNI on
+  # purpose, join NotReady, and wait for install-cilium.sh. This module is
+  # then the thing that proves the install worked: it cannot reach ACTIVE
+  # until a node is Ready.
+  depends_on = [module.cilium]
+}
+
+###############################################################################
 # Addons and storage
 #
 # After the node groups, not before: CoreDNS and the EBS CSI controller need
@@ -62,7 +139,7 @@ module "cilium" {
 ###############################################################################
 
 module "cluster_addons" {
-  count  = local.create_addons ? 1 : 0
+  count  = var.create_cluster ? 1 : 0
   source = "./modules/cluster-addons"
 
   cluster_name          = module.eks[0].cluster_name
@@ -71,7 +148,71 @@ module "cluster_addons" {
 
   tags = var.tags
 
-  depends_on = [module.node_group]
+  depends_on = [module.nodegroups]
+}
+
+###############################################################################
+# Karpenter -- burst above the node group floors
+###############################################################################
+
+module "karpenter" {
+  count  = var.create_cluster ? 1 : 0
+  source = "./modules/karpenter"
+
+  cluster_name     = module.eks[0].cluster_name
+  cluster_endpoint = module.eks[0].cluster_endpoint
+  chart_version    = var.karpenter_version
+  replicas         = var.karpenter_replicas
+
+  tags = var.tags
+
+  # cluster_addons carries both the CoreDNS addon (the controller needs DNS)
+  # and the Pod Identity agent, which is how the v21 submodule authenticates
+  # the controller -- without it Karpenter cannot call EC2 at all.
+  depends_on = [module.cluster_addons]
+}
+
+# Attach-to-an-existing-cluster path only. On the create path the node role is
+# created and named by the Karpenter submodule above.
+module "karpenter_node_iam" {
+  count  = var.create_cluster ? 0 : 1
+  source = "./modules/karpenter-node-iam"
+
+  node_iam_role_name = var.node_iam_role_name
+  tags               = var.tags
+}
+
+# Each pool shares its tier's taint (workload=<tier>:NoSchedule) and label with
+# the managed node group of the same name, so a tier's pods schedule onto
+# either half without knowing which is which.
+module "nodepool" {
+  source = "./modules/karpenter-nodepool"
+
+  for_each = var.karpenter_nodepools
+
+  name               = "${each.key}-pool"
+  cluster_name       = local.cluster_name
+  node_iam_role_name = local.node_iam_role_name
+
+  taint_value = each.key
+
+  architecture            = "arm64" # Graviton
+  ami_alias               = var.karpenter_ami_alias
+  min_instance_generation = var.karpenter_min_instance_generation
+
+  instance_categories = each.value.instance_categories
+  instance_sizes      = each.value.instance_sizes
+  capacity_types      = each.value.capacity_types
+
+  volume_size_gb = each.value.volume_size_gb
+  limits         = each.value.limits
+
+  consolidate_after  = each.value.consolidate_after
+  disruption_budgets = each.value.disruption_budgets
+
+  tags = var.tags
+
+  depends_on = [module.karpenter]
 }
 
 ###############################################################################
@@ -103,10 +244,10 @@ module "ingress" {
 # GitLab
 ###############################################################################
 
-# Preconditions that are about the *caller's* configuration rather than the
-# module's own inputs, so they cannot live as variable validations inside it.
-# All three are failure modes that otherwise surface twenty minutes into an
-# install as a Pending pod.
+# Preconditions about the *caller's* configuration rather than the module's
+# own inputs, so they cannot live as variable validations inside it. All three
+# are failure modes that otherwise surface twenty minutes into an install as a
+# Pending pod.
 resource "terraform_data" "gitlab_preconditions" {
   count = local.gitlab_enabled ? 1 : 0
 
@@ -174,42 +315,4 @@ module "gitlab" {
     module.ingress,
     terraform_data.gitlab_preconditions,
   ]
-}
-
-###############################################################################
-# Karpenter NodePools -- burst capacity above the managed node group floors.
-#
-# Each pool shares its tier's taint (workload=<tier>:NoSchedule) and label with
-# the managed node group of the same name in nodegroups.tf, so a tier's pods
-# schedule onto either half without knowing which is which.
-###############################################################################
-
-module "nodepool" {
-  source = "./modules/karpenter-nodepool"
-
-  for_each = var.karpenter_nodepools
-
-  name               = "${each.key}-pool"
-  cluster_name       = local.cluster_name
-  node_iam_role_name = local.node_iam_role_name
-
-  taint_value = each.key
-
-  architecture            = "arm64" # Graviton
-  ami_alias               = var.karpenter_ami_alias
-  min_instance_generation = var.karpenter_min_instance_generation
-
-  instance_categories = each.value.instance_categories
-  instance_sizes      = each.value.instance_sizes
-  capacity_types      = each.value.capacity_types
-
-  volume_size_gb = each.value.volume_size_gb
-  limits         = each.value.limits
-
-  consolidate_after  = each.value.consolidate_after
-  disruption_budgets = each.value.disruption_budgets
-
-  tags = var.tags
-
-  depends_on = [helm_release.karpenter]
 }

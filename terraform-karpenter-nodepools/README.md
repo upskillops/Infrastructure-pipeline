@@ -5,22 +5,50 @@ Provisions a VPC, an EKS cluster, **Cilium as the sole CNI**, four **Graviton
 above them.
 
 ```
-.
-├── main.tf           # composition ONLY -- wires the modules together
-├── vpc.tf            # VPC, public/private subnets, NAT per AZ
-├── eks.tf            # EKS control plane ONLY (no compute -- see below)
-├── nodegroups.tf     # 4 Graviton managed node groups (the per-tier floor)
-├── karpenter.tf      # Karpenter controller (burst above the floor)
-├── providers.tf      # exec-based EKS auth
-├── variables.tf outputs.tf versions.tf
-├── iam-existing-cluster.tf   # node IAM role, only when create_cluster = false
+.                         # root holds NOTHING but composition and inputs
+├── main.tf               # module wiring + explicit depends_on ordering
+├── variables.tf
+├── outputs.tf
+├── providers.tf          # exec-based EKS auth (+ the existing-cluster lookup)
+├── versions.tf
+├── terraform.tfvars      # and free-tier.tfvars
 └── modules/
-    ├── cilium/              # sole CNI: replaces VPC CNI *and* kube-proxy
-    ├── cluster-addons/      # CoreDNS, Pod Identity, EBS CSI, StorageClasses
-    ├── ingress/             # AWS LB Controller, external-dns, Route53 zone
-    ├── gitlab/              # RDS + ElastiCache + 12 S3 buckets + the release
-    └── karpenter-nodepool/  # 1 EC2NodeClass + 1 NodePool
+    ├── vpc/                 VPC, subnets, NAT per AZ, discovery tags
+    ├── eks/                 control plane ONLY (no compute -- see below)
+    ├── cilium/              sole CNI: replaces VPC CNI *and* kube-proxy
+    ├── nodegroups/          4 Graviton managed node groups (the per-tier floor)
+    ├── cluster-addons/      CoreDNS, Pod Identity, EBS CSI, StorageClasses
+    ├── karpenter/           Karpenter controller (burst above the floor)
+    ├── karpenter-nodepool/  1 EC2NodeClass + 1 NodePool, instantiated per tier
+    ├── karpenter-node-iam/  node role, existing-cluster path only
+    ├── ingress/             AWS LB Controller, external-dns, Route53 zone
+    └── gitlab/              RDS + ElastiCache + 12 S3 buckets + the release
 ```
+
+Every resource lives in a module. `main.tf` declares no resources at all
+except one `terraform_data` holding cross-cutting preconditions.
+
+`vpc`, `eks` and `karpenter` are thin wrappers over the upstream
+`terraform-aws-modules` equivalents. The wrapper earns its keep by holding the
+non-obvious settings — AZ selection and the `karpenter.sh/discovery` subnet
+tags in `vpc`, the all-protocols node-SG rule that Cilium ENI mode requires in
+`eks` — rather than leaving them inline in the root.
+
+Ordering between the modules is the whole point of the design, so `main.tf`
+states it explicitly with `depends_on` rather than leaving it to be inferred:
+
+```
+vpc → eks → [cilium] → nodegroups → cluster-addons → ingress → gitlab
+                                           └→ karpenter → nodepools
+```
+
+The brackets around cilium are deliberate: under the default
+`cilium_install_method = "helm"` that module creates only an IAM role, and the
+CNI arrives out of band while `nodegroups` blocks. See `../helm-charts`.
+
+One consequence of the split worth knowing: inside a module there is no
+`count = enabled ? 1 : 0` on every resource, because the caller gates the
+whole module block. That removed several hundred `[0]` index expressions.
 
 VPC, EKS and the Karpenter controller are direct calls to upstream
 `terraform-aws-modules` — deliberately not wrapped again in a local module,

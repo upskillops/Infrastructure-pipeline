@@ -8,16 +8,15 @@ data "aws_eks_cluster" "existing" {
   name  = var.cluster_name
 }
 
+# Resolved here rather than in main.tf because the provider blocks below are
+# what consume them, and they have to work on both paths -- a cluster this
+# configuration creates, and one it merely attaches to.
 locals {
   cluster_name     = var.create_cluster ? module.eks[0].cluster_name : data.aws_eks_cluster.existing[0].name
   cluster_endpoint = var.create_cluster ? module.eks[0].cluster_endpoint : data.aws_eks_cluster.existing[0].endpoint
   cluster_ca_data  = var.create_cluster ? module.eks[0].cluster_certificate_authority_data : data.aws_eks_cluster.existing[0].certificate_authority[0].data
 
-  node_iam_role_name = var.create_cluster ? module.karpenter[0].node_iam_role_name : aws_iam_role.karpenter_node[0].name
-
-  # Cilium needs the API server host/port directly: with kube-proxy removed there
-  # is nothing to translate the kubernetes.default ClusterIP until Cilium is up.
-  cluster_api_host = replace(local.cluster_endpoint, "https://", "")
+  node_iam_role_name = var.create_cluster ? module.karpenter[0].node_iam_role_name : module.karpenter_node_iam[0].node_iam_role_name
 }
 
 # NOTE ON AUTH -- this is the fix for the single biggest source of failed applies

@@ -29,8 +29,8 @@ output "private_subnet_ids" {
 output "node_groups" {
   description = "Graviton managed node groups providing each tier's guaranteed floor."
   value = var.create_cluster ? {
-    for k, ng in module.node_group : k => {
-      name           = ng.node_group_id
+    for k, id in module.nodegroups[0].groups : k => {
+      name           = id
       instance_types = var.workload_node_groups[k].instance_types
       min_size       = var.workload_node_groups[k].min_size
       max_size       = var.workload_node_groups[k].max_size
@@ -51,7 +51,7 @@ output "karpenter_node_role_name" {
 
 output "nodegroup_node_role_name" {
   description = "IAM role shared by the managed node groups."
-  value       = var.create_cluster ? aws_iam_role.node[0].name : null
+  value       = one(module.nodegroups[*].node_iam_role_name)
 }
 
 ###############################################################################
