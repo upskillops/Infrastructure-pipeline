@@ -19,8 +19,18 @@
 # window, and then waits for the apply to complete now that the nodes can go
 # Ready. Doing it by hand is the same thing in two terminals:
 #
-#   terminal 1:  terraform apply
+#   terminal 1:  terraform apply -target=module.karpenter   # stage 1
 #   terminal 2:  ./bin/install-cilium.sh     # once `kubectl get nodes` shows NotReady
+#   terminal 1:  terraform apply                              # stage 2
+#
+# WHY TWO STAGES
+# --------------
+# Karpenter's NodePools are submitted with kubernetes_manifest, which resolves
+# the CRD against the live API server at PLAN time. The CRDs arrive with the
+# Karpenter Helm release, so a single `terraform apply` on a new cluster fails
+# at plan. Stage 1 (-target=module.karpenter) builds the cluster and installs
+# the CRDs; stage 2 plans cleanly against them. See the header of
+# terraform-karpenter-nodepools/modules/karpenter-nodepool/main.tf.
 
 . "$(dirname "$0")/lib.sh"
 
@@ -59,8 +69,10 @@ require_chart "$CHART_DIR/cilium-${CILIUM_CHART_VERSION}.tgz"
 log "terraform init"
 terraform -chdir="$TF_DIR" init -input=false >/dev/null
 
-log "terraform plan"
-terraform -chdir="$TF_DIR" plan -input=false -out="$TF_DIR/.bootstrap.tfplan"
+# -target is load-bearing, not a shortcut: see WHY TWO STAGES above.
+log "terraform plan (stage 1: cluster, nodes, addons, Karpenter CRDs)"
+terraform -chdir="$TF_DIR" plan -input=false \
+  -target=module.karpenter -out="$TF_DIR/.bootstrap.tfplan"
 
 if [ "$PLAN_ONLY" = 1 ]; then
   ok "Plan only -- stopping here."
@@ -84,7 +96,7 @@ esac
 APPLY_LOG="$HELM_DIR/.rendered/terraform-apply.log"
 mkdir -p "$(dirname "$APPLY_LOG")"
 
-log "terraform apply (background) -- log: $APPLY_LOG"
+log "terraform apply, stage 1 (background) -- log: $APPLY_LOG"
 terraform -chdir="$TF_DIR" apply -input=false "$TF_DIR/.bootstrap.tfplan" > "$APPLY_LOG" 2>&1 &
 TF_PID=$!
 
@@ -164,8 +176,20 @@ if [ "$TF_RC" -ne 0 ]; then
   tail -40 "$APPLY_LOG" >&2
   die "fix the apply, re-run \`terraform -chdir=$TF_DIR apply\`, then run bin/install-gitlab.sh"
 fi
-ok "terraform apply complete"
+ok "terraform apply stage 1 complete"
 rm -f "$TF_DIR/.bootstrap.tfplan"
+
+###############################################################################
+# 5b. Stage 2 -- everything that could not be planned until the CRDs existed
+###############################################################################
+
+log "terraform apply, stage 2 (Karpenter NodePools, ingress, GitLab's AWS side)"
+# tee swallows terraform's exit code, so take it from PIPESTATUS -- captured
+# on the very next line, because any other command in between resets it.
+terraform -chdir="$TF_DIR" apply -input=false -auto-approve 2>&1 | tee -a "$APPLY_LOG" | tail -5
+STAGE2_RC=${PIPESTATUS[0]}
+[ "$STAGE2_RC" -eq 0 ] || die "stage 2 apply failed (exit $STAGE2_RC) -- see $APPLY_LOG"
+ok "terraform apply stage 2 complete"
 
 ###############################################################################
 # 6. GitLab

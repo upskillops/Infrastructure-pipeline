@@ -1,0 +1,96 @@
+# Exposes GitLab through the shared istio-ingressgateway, following the same
+# pattern as the harbor/argocd/vault gateways already on this cluster: HTTP
+# redirects to HTTPS, TLS terminates at the gateway with the wildcard cert
+# (the `wildcard-upskillops-in-tls` secret lives in istio-system).
+#
+# Note: git over SSH is NOT here - an L7 gateway can't carry it. gitlab-shell
+# gets its own MetalLB address (192.168.0.142) via the Helm values.
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata:
+  name: gitlab-gateway
+  namespace: gitlab
+spec:
+  selector:
+    istio: ingressgateway
+  servers:
+    - port:
+        number: 80
+        name: http
+        protocol: HTTP
+      hosts:
+        - gitlab.upskillops.in
+        - registry.upskillops.in
+        - gitlab-minio.upskillops.in
+      tls:
+        httpsRedirect: true
+    - port:
+        number: 443
+        name: https
+        protocol: HTTPS
+      hosts:
+        - gitlab.upskillops.in
+        - registry.upskillops.in
+        - gitlab-minio.upskillops.in
+      tls:
+        mode: SIMPLE
+        credentialName: wildcard-upskillops-in-tls
+---
+# The chart's own Ingress points at workhorse (service port 8181), not at
+# puma on 8080 - workhorse is what handles git-over-HTTP and LFS.
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: gitlab
+  namespace: gitlab
+spec:
+  gateways:
+    - gitlab-gateway
+  hosts:
+    - gitlab.upskillops.in
+  http:
+    - route:
+        - destination:
+            host: gitlab-webservice-default.gitlab.svc.cluster.local
+            port:
+              number: 8181
+      # Cloning/pushing a large repo easily outruns a short route timeout.
+      timeout: 1800s
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: gitlab-registry
+  namespace: gitlab
+spec:
+  gateways:
+    - gitlab-gateway
+  hosts:
+    - registry.upskillops.in
+  http:
+    - route:
+        - destination:
+            host: gitlab-registry.gitlab.svc.cluster.local
+            port:
+              number: 5000
+      timeout: 1800s
+---
+# GitLab redirects artifact/LFS downloads straight at MinIO's external URL,
+# so the object store needs to be reachable from outside too.
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: gitlab-minio
+  namespace: gitlab
+spec:
+  gateways:
+    - gitlab-gateway
+  hosts:
+    - gitlab-minio.upskillops.in
+  http:
+    - route:
+        - destination:
+            host: gitlab-minio-svc.gitlab.svc.cluster.local
+            port:
+              number: 9000
+      timeout: 1800s

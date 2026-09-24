@@ -1,0 +1,173 @@
+###############################################################################
+# GitLab CE on EKS -- self-contained.
+#
+# This is the EKS equivalent of what runs on the on-prem cluster: everything
+# GitLab needs lives inside the cluster. No RDS, no ElastiCache, no S3, no
+# Terraform outputs, no placeholder rendering. One helm command.
+#
+#   helm upgrade --install gitlab charts/gitlab-9.11.12.tgz \
+#     -n gitlab --create-namespace \
+#     -f values/gitlab-eks-standalone.yaml \
+#     --set global.hosts.domain=example.com \
+#     --set certmanager-issuer.email=you@example.com \
+#     --timeout 25m
+#
+# This is NOT the production path. For that use values/gitlab.values.yaml,
+# which is chart 10.4.0 against Terraform-provisioned RDS/ElastiCache/S3 --
+# see README.md. The two are independent; installing this one does not touch
+# anything that one owns.
+#
+# Chart 9.11.12 is required, not a preference: chart 10.0.0 deleted the
+# bundled PostgreSQL, Redis and MinIO subcharts, so "self-contained" is only
+# possible on the 9.x line. 9.11.12 is the last 9.x release.
+#
+# Prerequisites on the cluster (both are one-time, see eks-standalone/README):
+#   - the aws-ebs-csi-driver EKS addon
+#   - the `gp3` StorageClass in eks-standalone/storageclass-gp3.yaml
+###############################################################################
+
+global:
+  edition: ce
+
+  # Override these two on the command line rather than editing here, so this
+  # file stays the same across environments.
+  hosts:
+    domain: example.com     # --set global.hosts.domain=...
+    https: true
+
+  # The chart's own nginx controller terminates TLS, with a Let's Encrypt cert
+  # the chart's cert-manager issues. Nothing else in the cluster is required.
+  ingress:
+    enabled: true
+    configureCertmanager: true
+    class: nginx
+
+  shell:
+    port: 22
+
+  # Agent server -- not needed for a base install, and it is another pod.
+  kas:
+    enabled: false
+
+# Let's Encrypt registration address for the chart-managed ClusterIssuer.
+certmanager-issuer:
+  email: you@example.com    # --set certmanager-issuer.email=...
+
+# Install cert-manager as part of this release. Set this to false if the
+# cluster already runs cert-manager -- two installs will fight over the CRDs.
+installCertmanager: true
+
+# ---- Ingress: nginx fronted by an NLB ----
+# `aws-load-balancer-type: nlb` is the in-tree EKS cloud provider, which is
+# present on every EKS cluster. That is deliberate: it means this install has
+# no dependency on the AWS Load Balancer Controller being installed first.
+# If you do run that controller, switch to `external` + nlb-target-type: ip
+# for a genuine IP-target NLB.
+nginx-ingress:
+  enabled: true
+  controller:
+    replicaCount: 2
+    service:
+      annotations:
+        service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+        service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+        service.beta.kubernetes.io/aws-load-balancer-backend-protocol: "tcp"
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+
+# ---- Bundled extras we do not want ----
+prometheus:
+  install: false      # run kube-prometheus-stack separately if you want metrics
+
+gitlab-runner:
+  install: false      # enable once GitLab is up and you have a runner token
+
+# ---- GitLab components ----
+# Sized for a 3-node m6i.large (2 vCPU / 8Gi) group, which is the smallest
+# thing that comfortably holds this. Scale up before real usage -- GitLab's
+# reference architecture for 1,000 users starts at 8 vCPU / 16Gi.
+gitlab:
+  webservice:
+    minReplicas: 2
+    maxReplicas: 4
+    resources:
+      requests:
+        cpu: 500m
+        memory: 2500Mi
+  sidekiq:
+    minReplicas: 1
+    maxReplicas: 3
+    resources:
+      requests:
+        cpu: 300m
+        memory: 1500Mi
+  gitaly:
+    persistence:
+      size: 100Gi
+      storageClass: gp3
+    resources:
+      requests:
+        cpu: 300m
+        memory: 1Gi
+  gitlab-shell:
+    minReplicas: 1
+    maxReplicas: 2
+    # No LoadBalancer here on purpose. The bundled nginx controller already
+    # publishes TCP 22 on its NLB and forwards it to gitlab-shell, so giving
+    # this its own Service type LoadBalancer would stand up a second NLB
+    # exposing the same SSH endpoint. (The on-prem install does need a
+    # separate address, because there nginx is off and Istio fronts GitLab --
+    # an L7 gateway cannot carry SSH.)
+  toolbox:
+    resources:
+      requests:
+        cpu: 100m
+        memory: 512Mi
+
+registry:
+  enabled: true
+  hpa:
+    minReplicas: 1
+    maxReplicas: 2
+
+# ---- Bundled datastores ----
+# Single-replica and cluster-local. This is the trade this file makes: no RDS
+# or ElastiCache bill, but also no managed backups, no multi-AZ failover, and
+# a Gitaly/Postgres EBS volume that is a single point of failure. Take
+# snapshots, or move to values/gitlab.values.yaml.
+postgresql:
+  install: true
+  primary:
+    persistence:
+      size: 50Gi
+      storageClass: gp3
+    resources:
+      requests:
+        cpu: 300m
+        memory: 1Gi
+  metrics:
+    enabled: false
+
+redis:
+  install: true
+  master:
+    persistence:
+      size: 10Gi
+      storageClass: gp3
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+  metrics:
+    enabled: false
+
+minio:
+  persistence:
+    size: 100Gi
+    storageClass: gp3
+  resources:
+    requests:
+      cpu: 100m
+      memory: 512Mi

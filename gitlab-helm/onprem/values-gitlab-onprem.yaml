@@ -1,0 +1,178 @@
+# GitLab CE on upskillops-cluster (on-prem kubeadm, Cilium + Istio + MetalLB + Longhorn)
+#
+#   helm upgrade --install gitlab gitlab/gitlab --version 9.11.12 \
+#     -n gitlab --create-namespace -f values-gitlab-onprem.yaml --timeout 20m
+#
+# Chart 9.11.x is deliberate: 10.x dropped the bundled PostgreSQL/Redis/MinIO
+# subcharts, and this cluster has no managed database to point at.
+#
+# Ingress is Istio, not the chart's nginx - see gitlab-istio.yaml for the
+# Gateway + VirtualServices. Resource requests are trimmed hard to fit the
+# ~1.7 CPU / ~9.6Gi that is actually free on worker3; see README-onprem.md.
+global:
+  edition: ce
+
+  hosts:
+    domain: upskillops.in
+    https: true
+    gitlab:
+      name: gitlab.upskillops.in
+    registry:
+      name: registry.upskillops.in
+    minio:
+      name: gitlab-minio.upskillops.in
+    ssh: gitlab.upskillops.in
+
+  # The chart must not create Ingress objects or its own controller: the
+  # istio-ingressgateway fronts GitLab and terminates TLS with the existing
+  # wildcard-upskillops-in-tls cert. `hosts.https: true` still makes GitLab
+  # generate https:// clone and registry URLs.
+  ingress:
+    enabled: false
+    configureCertmanager: false
+    tls:
+      enabled: false
+
+  # git over SSH cannot go through an L7 gateway - MetalLB gives it its own IP.
+  shell:
+    port: 22
+
+  # Agent server: not needed for a base install, and it is another pod.
+  kas:
+    enabled: false
+
+# ---- Bundled extras we do not want ----
+installCertmanager: false   # cert-manager already runs cluster-wide
+nginx-ingress:
+  enabled: false        # Istio instead
+prometheus:
+  install: false        # kube-prometheus-stack already runs in `monitoring`
+gitlab-runner:
+  install: false        # runners already live in the `gitlab-runner` namespace
+
+# ---- GitLab components ----
+gitlab:
+  webservice:
+    minReplicas: 1
+    maxReplicas: 1
+    resources:
+      requests:
+        # Raised from 200m/2Gi. At 200m Puma was booting so slowly under CPU
+        # contention that it missed the liveness deadline and was killed
+        # mid-boot, restarting forever. It also sat at 2021Mi against a 2Gi
+        # request with nobody using it.
+        cpu: 400m
+        memory: 2560Mi
+    workhorse:
+      resources:
+        requests:
+          cpu: 50m
+          memory: 128Mi
+    deployment:
+      # Chart default is 20s + 3x60s, i.e. killed ~200s in. Puma needs longer
+      # than that here, so liveness was restarting a container that was still
+      # starting normally. 90s + 10x30s = ~390s before a real hang is called.
+      livenessProbe:
+        initialDelaySeconds: 90
+        periodSeconds: 30
+        timeoutSeconds: 30
+        failureThreshold: 10
+  sidekiq:
+    minReplicas: 1
+    maxReplicas: 1
+    resources:
+      requests:
+        # Same story as webservice: 100m was not enough CPU to finish booting
+        # inside the liveness window. Its log showed it reaching "reliable
+        # fetch activated" and then being SIGTERMed by the probe.
+        cpu: 300m
+        memory: 1Gi
+    livenessProbe:
+      initialDelaySeconds: 90
+      periodSeconds: 30
+      timeoutSeconds: 30
+      failureThreshold: 10
+  gitaly:
+    persistence:
+      size: 50Gi
+      storageClass: longhorn-gitlab
+    resources:
+      requests:
+        cpu: 100m
+        memory: 512Mi
+    # The chart's startup probe allows 1s per attempt, which a Longhorn-backed
+    # Gitaly on a loaded node does not always answer in time:
+    #   "failed to connect service 10.0.1.194:8075 within 1s".
+    statefulset:
+      startupProbe:
+        periodSeconds: 5
+        timeoutSeconds: 5
+        failureThreshold: 60
+  gitlab-shell:
+    minReplicas: 1
+    maxReplicas: 1
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+    service:
+      type: LoadBalancer
+      annotations:
+        metallb.universe.tf/loadBalancerIPs: 192.168.0.142
+  toolbox:
+    resources:
+      requests:
+        cpu: 50m
+        memory: 256Mi
+  migrations:
+    resources:
+      requests:
+        cpu: 100m
+        memory: 512Mi
+  gitlab-exporter:
+    enabled: false
+
+registry:
+  hpa:
+    minReplicas: 1
+    maxReplicas: 1
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+
+# ---- Bundled datastores ----
+postgresql:
+  install: true
+  primary:
+    persistence:
+      size: 20Gi
+      storageClass: longhorn-gitlab
+    resources:
+      requests:
+        cpu: 150m
+        memory: 768Mi
+  metrics:
+    enabled: false
+
+redis:
+  install: true
+  master:
+    persistence:
+      size: 5Gi
+      storageClass: longhorn-gitlab
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+  metrics:
+    enabled: false
+
+minio:
+  persistence:
+    size: 20Gi
+    storageClass: longhorn-gitlab
+  resources:
+    requests:
+      cpu: 50m
+      memory: 256Mi

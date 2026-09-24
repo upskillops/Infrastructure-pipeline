@@ -1,0 +1,104 @@
+###############################################################################
+# GitLab Runner -- upskillops-cluster, `gitlab` namespace.
+#
+# Registers against the in-cluster GitLab installed by values-gitlab-onprem.yaml
+# and runs CI jobs with the Kubernetes executor, in the same namespace.
+#
+#   kubectl -n gitlab create secret generic gitlab-runner-token \
+#     --from-file=runner-token=<file containing the glrt- token>
+#
+#   helm upgrade --install gitlab-runner charts/gitlab-runner-0.88.4.tgz \
+#     -n gitlab -f values-gitlab-runner.yaml
+#
+# Chart 0.88.4 is Runner 18.11.4, deliberately matched to the GitLab 18.11.11
+# server. A runner newer than its GitLab is not a supported combination, so do
+# not bump this chart independently of the GitLab chart.
+#
+# The token is a `glrt-` *authentication* token, not the old registration
+# token. With it the runner authenticates rather than registering, so no
+# `runner-registration-token` is involved and the runner's identity, tags and
+# untagged-job setting are all configured in the GitLab UI, not here.
+###############################################################################
+
+gitlabUrl: https://gitlab.upskillops.in/
+
+# The token lives in a Secret created out of band, so it never lands in this
+# file or in `helm get values`.
+runners:
+  secret: gitlab-runner-token
+
+  config: |
+    [[runners]]
+      # The runner warns at startup if this is left at the default of 1:
+      # "Request bottleneck: ... causing job delays during long polling".
+      # It governs concurrent API requests to GitLab, not concurrent jobs.
+      request_concurrency = 4
+      # Jobs run in the same namespace as GitLab itself. This cluster is
+      # tight on memory, so job pods are given small but real requests --
+      # unbounded CI pods are the fastest way to evict GitLab.
+      [runners.kubernetes]
+        namespace = "{{.Release.Namespace}}"
+        image = "alpine:3.21"
+        cpu_request = "200m"
+        cpu_limit = "1"
+        memory_request = "256Mi"
+        memory_limit = "1Gi"
+        helper_cpu_request = "50m"
+        helper_cpu_limit = "250m"
+        helper_memory_request = "64Mi"
+        helper_memory_limit = "256Mi"
+        service_cpu_request = "100m"
+        service_cpu_limit = "500m"
+        service_memory_request = "128Mi"
+        service_memory_limit = "512Mi"
+        poll_timeout = 600
+      [runners.cache]
+        Type = "s3"
+        Path = "gitlab-runner"
+        Shared = true
+        # Reuses the MinIO that ships with the GitLab release -- no extra
+        # object store to run. Credentials come from the cache secret below.
+        [runners.cache.s3]
+          ServerAddress = "gitlab-minio-svc.gitlab.svc:9000"
+          BucketName = "runner-cache"
+          Insecure = true
+
+# Distributed cache credentials -- the bundled MinIO's keys.
+cache:
+  secretName: gitlab-runner-cache
+
+# How many jobs this one manager will run at once. Kept low on purpose: the
+# cluster has roughly 1 spare core once GitLab is running, and each concurrent
+# job reserves 200m plus its helper.
+concurrent: 4
+checkInterval: 10
+
+rbac:
+  create: true
+  rules:
+    - apiGroups: [""]
+      resources: ["pods", "pods/exec", "pods/attach", "pods/log", "secrets", "configmaps", "services"]
+      verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+    - apiGroups: [""]
+      resources: ["events"]
+      verbs: ["list", "watch"]
+
+# The manager itself is small -- it schedules pods, it does not build.
+# Limits as well as requests, because this cluster runs a Kyverno
+# require-requests-limits policy.
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+podSecurityContext:
+  runAsUser: 100
+  fsGroup: 65533
+
+# GitLab's certificate is a real Let's Encrypt wildcard and the runner
+# resolves gitlab.upskillops.in out to the public address and back in, which
+# this cluster's NAT handles. No custom CA bundle is needed; if that ever
+# changes, mount one with certsSecretName instead of disabling verification.

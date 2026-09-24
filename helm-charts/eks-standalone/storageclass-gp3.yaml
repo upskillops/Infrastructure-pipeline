@@ -1,0 +1,21 @@
+# EKS ships `gp2` as the default StorageClass and nothing else. GitLab's
+# volumes here name `gp3`, which is faster and cheaper for the same size.
+#
+# Requires the aws-ebs-csi-driver addon -- an EKS cluster without it will
+# leave every PVC Pending with no obvious error:
+#   aws eks create-addon --cluster-name <name> --addon-name aws-ebs-csi-driver
+#
+# reclaimPolicy: Retain because Gitaly's volume holds the git repositories.
+# Deleting the release should not delete the repos with it.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gp3
+provisioner: ebs.csi.aws.com
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+reclaimPolicy: Retain
+parameters:
+  type: gp3
+  encrypted: "true"
+  fsType: ext4

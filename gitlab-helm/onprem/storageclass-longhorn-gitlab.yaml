@@ -1,0 +1,16 @@
+# worker1 is NotReady, so only 2 Longhorn nodes are schedulable. The default
+# `longhorn` class asks for 3 replicas, which leaves every volume permanently
+# Degraded. GitLab's volumes use 2 instead.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: longhorn-gitlab
+provisioner: driver.longhorn.io
+allowVolumeExpansion: true
+reclaimPolicy: Retain
+volumeBindingMode: Immediate
+parameters:
+  numberOfReplicas: "2"
+  staleReplicaTimeout: "30"
+  fsType: ext4
+  dataLocality: best-effort

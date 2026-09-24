@@ -50,6 +50,28 @@ tfvar() {
 [ -n "$CLUSTER" ] || die "cluster name not given: pass --cluster or set CLUSTER_NAME"
 [ -n "$REGION" ]  || REGION=us-east-1
 
+# Refuse to run when Terraform owns the release.
+#
+# `cilium_install_method` defaults to "terraform" now, which means the common
+# case is that `terraform apply` has already installed Cilium and running this
+# script would fight it over the same Helm release. The --from-terraform path
+# below catches that from the state file, but the default path reads the AWS
+# API and would not, so the check has to happen here as well.
+#
+# tfvars is the only source readable while an apply holds the state lock, and
+# an unset value means the variable default -- which is "terraform". So the
+# script proceeds only when tfvars says "helm" explicitly.
+INSTALL_METHOD=$(tfvar cilium_install_method || true)
+if [ "${INSTALL_METHOD:-terraform}" != "helm" ]; then
+  die "cilium_install_method is \"${INSTALL_METHOD:-terraform (unset, so the default)}\".
+Terraform installs Cilium itself under that setting, and installing it again
+here would fight over the same Helm release.
+
+This script is only for cilium_install_method = \"helm\". If that is what you
+want, set it explicitly in $TF_DIR/terraform.tfvars and re-apply; otherwise
+just let \`terraform apply\` do it."
+fi
+
 CHART="$CHART_DIR/cilium-${CILIUM_CHART_VERSION}.tgz"
 require_chart "$CHART"
 
